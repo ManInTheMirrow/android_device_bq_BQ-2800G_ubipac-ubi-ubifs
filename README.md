@@ -1,5 +1,15 @@
 # Device Tree For BQ 2800G Online
 
+See also:
+1. https://gerrit.omnirom.org/c/android_bootable_recovery/+/8409
+2. https://github.com/omnirom/android_bootable_recovery/tree/1f0cda2f3f90222cbd8725e2bbe86565f522aa23
+3. https://wiki.postmarketos.org/wiki/UBIFS
+4. https://wiki.postmarketos.org/wiki/Nobby_230_(nobby-230)
+
+UBI-Utils:
+1. https://github.com/thewisenerd/android_external_mtd-utils
+2. http://www.linux-mtd.infradead.org/doc/ubi.html#L_usptools
+
 ## Device specification
 
 Basic   | Spec Sheet

@@ -1,0 +1,3768 @@
+From 1f0cda2f3f90222cbd8725e2bbe86565f522aa23 Mon Sep 17 00:00:00 2001
+From: Dhinesh <dhinesh@ddworlds.(none)>
+Date: Thu, 03 Jul 2014 17:27:56 +0530
+Subject: [PATCH] Recovery: Add UBIFS File system support
+
+About UBIFS :
+````` ``````
+The Unsorted Block Image File System (UBIFS) is a successor to JFFS2, and
+competitor to LogFS as a file system for use with raw flash memory media.
+Development began in earnest in 2007, with the first stable release made
+to Linux kernel 2.6.27 in October 2008.[3] The file system is developed by
+ Nokia engineers with help of the University of Szeged, Hungary.
+Read more @ http://en.wikipedia.org/wiki/UBIFS
+
+At initial this patch was taken into TWRP (old branch) by Mr.Christiantroy.
+
+Conflicts:
+	minuitwrp/events.c
+
+Change-Id: I0c44d76a21c5beb93de883e66e2649603f37e2fe
+---
+
+diff --git a/Android.mk b/Android.mk
+index 3d95c84..4354d61 100644
+--- a/Android.mk
++++ b/Android.mk
+@@ -44,6 +44,13 @@
+     openrecoveryscript.cpp \
+     tarWrite.c
+ 
++LOCAL_SRC_FILES += \
++    ubi/ubiutils-common.c \
++    ubi/libubi.c
++
++LOCAL_C_INCLUDES += \
++     bootable/recovery/ubi/include
++
+ ifneq ($(TARGET_RECOVERY_REBOOT_SRC),)
+   LOCAL_SRC_FILES += $(TARGET_RECOVERY_REBOOT_SRC)
+ endif
+diff --git a/minuitwrp/events.c b/minuitwrp/events.c
+index 61fcf95..691e418 100644
+--- a/minuitwrp/events.c
++++ b/minuitwrp/events.c
+@@ -175,7 +175,7 @@
+ #else
+ #ifndef TW_INPUT_BLACKLIST
+     // Blacklist these "input" devices
+-    if (strcmp(e->deviceName, "bma250") == 0 || strcmp(e->deviceName, "bma150") == 0)
++    if (strcmp(e->deviceName, "bma250") == 0 || strcmp(e->deviceName, "bma150") == 0 || strcmp(e->deviceName, "light_sensor") == 0 || strcmp(e->deviceName, "mma8452") == 0)
+     {
+         printf("blacklisting %s input device\n", e->deviceName);
+         e->ignored = 1;
+diff --git a/mtdutils/mtdutils.c b/mtdutils/mtdutils.c
+index 158c880..83f0394 100644
+--- a/mtdutils/mtdutils.c
++++ b/mtdutils/mtdutils.c
+@@ -187,6 +187,23 @@
+ }
+ 
+ int
++mtd_get_index_by_name(const char *name)
++{
++    if (g_mtd_state.partitions != NULL) {
++        int i;
++        for (i = 0; i < g_mtd_state.partitions_allocd; i++) {
++            MtdPartition *p = &g_mtd_state.partitions[i];
++            if (p->device_index >= 0 && p->name != NULL) {
++                if (strcmp(p->name, name) == 0) {
++                    return p->device_index;
++                }
++            }
++        }
++    }
++    return -1;
++}
++
++int
+ mtd_mount_partition(const MtdPartition *partition, const char *mount_point,
+         const char *filesystem, int read_only)
+ {
+diff --git a/mtdutils/mtdutils.h b/mtdutils/mtdutils.h
+index c57d45d..59c267f 100644
+--- a/mtdutils/mtdutils.h
++++ b/mtdutils/mtdutils.h
+@@ -24,6 +24,7 @@
+ int mtd_scan_partitions(void);
+ 
+ const MtdPartition *mtd_find_partition_by_name(const char *name);
++int mtd_get_index_by_name(const char *name);
+ 
+ /* mount_point is like "/system"
+  * filesystem is like "yaffs2"
+diff --git a/partition.cpp b/partition.cpp
+index f1d7fd2..b837556 100644
+--- a/partition.cpp
++++ b/partition.cpp
+@@ -70,6 +70,10 @@
+ #include <linux/xattr.h>
+ #endif
+ 
++#include "roots.h"
++#include "libubi.h"
++#define DEFAULT_CTRL_DEV "/dev/ubi_ctrl"
++
+ using namespace std;
+ 
+ extern struct selabel_handle *selinux_handle;
+@@ -201,7 +205,7 @@
+ 			item_index++;
+ 		} else if (item_index == 1) {
+ 			// Primary Block Device
+-			if (Fstab_File_System == "mtd" || Fstab_File_System == "yaffs2") {
++			if (Fstab_File_System == "mtd" || Fstab_File_System == "yaffs2" ||  Fstab_File_System == "ubifs") {
+ 				MTD_Name = ptr;
+ 				Find_MTD_Block_Device(MTD_Name);
+ 			} else if (Fstab_File_System == "bml") {
+@@ -626,6 +630,7 @@
+ 		File_System == "ntfs" ||
+ 		File_System == "yaffs2" ||
+ 		File_System == "exfat" ||
++                File_System == "ubifs" ||
+ 		File_System == "f2fs" ||
+ 		File_System == "auto")
+ 		return true;
+@@ -943,6 +948,82 @@
+ 
+ 	// Check the current file system before mounting
+ 	Check_FS_Type();
++
++	if (Current_File_System == "ubifs") {
++		libubi_t libubi;
++		struct ubi_info ubi_info;
++		struct ubi_dev_info dev_info;
++		struct ubi_attach_request req;
++		int err;
++		char value[32] = {0};
++
++		mtd_scan_partitions();
++		int mtdn = mtd_get_index_by_name(MTD_Name.c_str());
++		if (mtdn < 0) {
++			LOGERR("bad mtd index for %s\n", MTD_Name.c_str());
++			return false;
++		}
++
++		libubi = libubi_open();
++		if (!libubi) {
++			LOGERR("libubi_open fail\n");
++			return false;
++		}
++
++		/*
++		* Make sure the kernel is fresh enough and this feature is supported.
++		*/
++		err = ubi_get_info(libubi, &ubi_info);
++		if (err) {
++			LOGERR("cannot get UBI information\n");
++			goto out_ubi_close;
++		}
++
++		if (ubi_info.ctrl_major == -1) {
++			LOGERR("MTD attach/detach feature is not supported by your kernel\n");
++			goto out_ubi_close;
++		}
++
++		req.dev_num = UBI_DEV_NUM_AUTO;
++		req.mtd_num = mtdn;
++		req.vid_hdr_offset = 0;
++		req.mtd_dev_node = NULL;
++
++		// make sure partition is detached before attaching
++		ubi_detach_mtd(libubi, DEFAULT_CTRL_DEV, mtdn);
++
++		err = ubi_attach(libubi, DEFAULT_CTRL_DEV, &req);
++		if (err) {
++			LOGERR("cannot attach mtd%d", mtdn);
++			goto out_ubi_close;
++		}
++
++		/* Print some information about the new UBI device */
++		err = ubi_get_dev_info1(libubi, req.dev_num, &dev_info);
++		if (err) {
++			LOGERR("cannot get information about newly created UBI device\n");
++			goto out_ubi_detach;
++		}
++
++		sprintf(value, "/dev/ubi0_userdata", dev_info.dev_num);
++
++		if (mount(value, Mount_Point.c_str(), Current_File_System.c_str(),  MS_NOATIME | MS_NODEV | MS_NODIRATIME, NULL )) {
++			LOGERR("cannot mount ubifs %s to %s\n", value,  Mount_Point.c_str());
++			goto out_ubi_detach;
++		}
++		LOGINFO("mount ubifs successful  %s to %s\n", value,  Mount_Point.c_str());
++
++		libubi_close(libubi);
++		return true;
++
++		out_ubi_detach:
++		ubi_detach_mtd(libubi, DEFAULT_CTRL_DEV, mtdn);
++
++		out_ubi_close:
++		libubi_close(libubi);
++		return false;
++	}
++
+ 	if (Current_File_System == "exfat" && TWFunc::Path_Exists("/sbin/exfat-fuse")) {
+ 		string cmd = "/sbin/exfat-fuse -o big_writes,max_read=131072,max_write=131072 " + Actual_Block_Device + " " + Mount_Point;
+ 		LOGINFO("cmd: %s\n", cmd.c_str());
+@@ -960,6 +1041,7 @@
+ #endif
+ 		}
+ 	}
++
+ 	if (Fstab_File_System == "yaffs2") {
+ 		// mount an MTD partition as a YAFFS2 filesystem.
+ 		const unsigned long flags = MS_NOATIME | MS_NODEV | MS_NODIRATIME;
+@@ -1077,6 +1159,55 @@
+ 		if (!Symlink_Mount_Point.empty())
+ 			umount(Symlink_Mount_Point.c_str());
+ 
++		if (Current_File_System == "ubifs") {
++			libubi_t libubi;
++			struct ubi_info ubi_info;
++			int ret;
++
++			umount(Mount_Point.c_str());
++
++			mtd_scan_partitions();
++			int mtdn = mtd_get_index_by_name(MTD_Name.c_str());
++			if (mtdn < 0) {
++				LOGERR("bad mtd index for %s\n", MTD_Name.c_str());
++				return false;
++			}
++
++			libubi = libubi_open();
++			if (!libubi) {
++				LOGERR("libubi_open fail\n");
++				return false;
++			}
++
++			/*
++			* Make sure the kernel is fresh enough and this feature is supported.
++			*/
++			ret = ubi_get_info(libubi, &ubi_info);
++			if (ret) {
++				LOGERR("cannot get UBI information\n");
++				goto out_ubi_close;
++			}
++
++			if (ubi_info.ctrl_major == -1) {
++				LOGERR("MTD detach/detach feature is not supported by your kernel\n");
++				goto out_ubi_close;
++			}
++
++			ret = ubi_detach_mtd(libubi, DEFAULT_CTRL_DEV, mtdn);
++			if (ret) {
++				LOGERR("cannot detach mtd%d\n", mtdn);
++				goto out_ubi_close;
++			}
++			LOGINFO("detach ubifs successful mtd%d\n", mtdn);
++
++			libubi_close(libubi);
++			return true;
++
++			out_ubi_close:
++				libubi_close(libubi);
++				return false;
++		}
++
+ 		umount(Mount_Point.c_str());
+ 		if (Is_Mounted()) {
+ 			if (Display_Error)
+@@ -1136,6 +1267,8 @@
+ 			wiped = Wipe_EXFAT();
+ 		else if (New_File_System == "yaffs2")
+ 			wiped = Wipe_MTD();
++                else if (New_File_System == "ubifs")
++			return Wipe_RMRF();
+ 		else if (New_File_System == "f2fs")
+ 			wiped = Wipe_F2FS();
+ 		else {
+@@ -1458,7 +1591,7 @@
+ 	const char* type;
+ 	blkid_probe pr;
+ 
+-	if (Fstab_File_System == "yaffs2" || Fstab_File_System == "mtd" || Fstab_File_System == "bml" || Ignore_Blkid)
++	if (Fstab_File_System == "yaffs2" || Fstab_File_System == "mtd" || Fstab_File_System == "bml" || Fstab_File_System == "ubifs" || Ignore_Blkid)
+ 		return; // Running blkid on some mtd devices causes a massive crash or needs to be skipped
+ 
+ 	Find_Actual_Block_Device();
+@@ -1660,6 +1793,9 @@
+ 	gui_print("Removing all files under '%s'\n", Mount_Point.c_str());
+ 	TWFunc::removeDir(Mount_Point, true);
+ 	Recreate_AndSec_Folder();
++	if (Current_File_System == "ubifs")
++		UnMount(true);
++
+ 	return true;
+ }
+ 
+diff --git a/ubi/include/android_utils.h b/ubi/include/android_utils.h
+new file mode 100644
+index 0000000..eb58d37
+--- /dev/null
++++ b/ubi/include/android_utils.h
+@@ -0,0 +1,12 @@
++#ifndef __ANDROID_UTILS_H__
++#define __ANDROID_UTILS_H__
++
++#ifndef MAJOR
++/* FIXME:  I am using illicit insider knowledge of
++ * kernel major/minor representation...  */
++#define MAJOR(dev) (((dev)>>8)&0xff)
++#define MINOR(dev) ((dev)&0xff)
++#endif
++
++#endif /* !__ANDROID_UTILS_H__ */
++
+diff --git a/ubi/include/common.h b/ubi/include/common.h
+new file mode 100644
+index 0000000..eb8d5fc
+--- /dev/null
++++ b/ubi/include/common.h
+@@ -0,0 +1,121 @@
++/*
++ * Copyright (c) Artem Bityutskiy, 2007, 2008
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
++ * the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++#ifndef __MTD_UTILS_COMMON_H__
++#define __MTD_UTILS_COMMON_H__
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <ctype.h>
++#include <string.h>
++#include <errno.h>
++
++#ifndef PROGRAM_NAME
++# error "You must define PROGRAM_NAME before including this header"
++#endif
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#ifndef MIN	/* some C lib headers define this for us */
++#define MIN(a, b) ((a) < (b) ? (a) : (b))
++#endif
++#ifndef MAX
++#define MAX(a, b) ((a) > (b) ? (a) : (b))
++#endif
++#define min(a, b) MIN(a, b) /* glue for linux kernel source */
++#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
++
++/* Verbose messages */
++#define bareverbose(verbose, fmt, ...) do {                        \
++	if (verbose)                                               \
++		printf(fmt, ##__VA_ARGS__);                        \
++} while(0)
++#define verbose(verbose, fmt, ...) \
++	bareverbose(verbose, "%s: " fmt "\n", PROGRAM_NAME, ##__VA_ARGS__)
++
++/* Normal messages */
++#define normsg_cont(fmt, ...) do {                                 \
++	printf("%s: " fmt, PROGRAM_NAME, ##__VA_ARGS__);           \
++} while(0)
++#define normsg(fmt, ...) do {                                      \
++	normsg_cont(fmt "\n", ##__VA_ARGS__);                      \
++} while(0)
++
++/* Error messages */
++#define errmsg(fmt, ...)  ({                                                \
++	fprintf(stderr, "%s: error!: " fmt "\n", PROGRAM_NAME, ##__VA_ARGS__); \
++	-1;                                                                 \
++})
++#define errmsg_die(fmt, ...) do {                                           \
++	exit(errmsg(fmt, ##__VA_ARGS__));                                   \
++} while(0)
++
++/* System error messages */
++#define sys_errmsg(fmt, ...)  ({                                            \
++	int _err = errno;                                                   \
++	errmsg(fmt, ##__VA_ARGS__);                                         \
++	fprintf(stderr, "%*serror %d (%s)\n", (int)sizeof(PROGRAM_NAME) + 1,\
++		"", _err, strerror(_err));                                  \
++	-1;                                                                 \
++})
++#define sys_errmsg_die(fmt, ...) do {                                       \
++	exit(sys_errmsg(fmt, ##__VA_ARGS__));                               \
++} while(0)
++
++/* Warnings */
++#define warnmsg(fmt, ...) do {                                                \
++	fprintf(stderr, "%s: warning!: " fmt "\n", PROGRAM_NAME, ##__VA_ARGS__); \
++} while(0)
++
++static inline int is_power_of_2(unsigned long long n)
++{
++	        return (n != 0 && ((n & (n - 1)) == 0));
++}
++
++/**
++ * simple_strtoX - convert a hex/dec/oct string into a number
++ * @snum: buffer to convert
++ * @error: set to 1 when buffer isn't fully consumed
++ */
++#define simple_strtoX(func, type) \
++static inline type simple_##func(const char *snum, int *error) \
++{ \
++	char *endptr; \
++	type ret = func(snum, &endptr, 0); \
++ \
++	if (error && (!*snum || *endptr)) { \
++		errmsg("%s: unable to parse the number '%s'", #func, snum); \
++		*error = 1; \
++	} \
++ \
++	return ret; \
++}
++simple_strtoX(strtol, long int)
++simple_strtoX(strtoll, long int)
++simple_strtoX(strtoul, unsigned long int)
++simple_strtoX(strtoull, unsigned long int)
++
++#include "xalloc.h"
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* !__MTD_UTILS_COMMON_H__ */
+diff --git a/ubi/include/libubi.h b/ubi/include/libubi.h
+new file mode 100644
+index 0000000..03b16ad
+--- /dev/null
++++ b/ubi/include/libubi.h
+@@ -0,0 +1,467 @@
++/*
++ * Copyright (c) International Business Machines Corp., 2006
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
++ * the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ *
++ * Author: Artem Bityutskiy
++ *
++ * UBI (Unsorted Block Images) library.
++ */
++
++#ifndef __LIBUBI_H__
++#define __LIBUBI_H__
++
++#include <ctype.h>
++#include <stdint.h>
++#include <mtd/ubi-user.h>
++#include <mtd/ubi-media.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* UBI version libubi is made for */
++#define LIBUBI_UBI_VERSION 1
++
++/* UBI library descriptor */
++typedef void * libubi_t;
++
++/**
++ * struct ubi_attach_request - MTD device attachment request.
++ * @dev_num: number to assign to the newly created UBI device
++ *           (%UBI_DEV_NUM_AUTO should be used to automatically assign the
++ *           number)
++ * @mtd_num: MTD device number to attach (used if @mtd_dev_node is %NULL)
++ * @mtd_dev_node: path to MTD device node to attach
++ * @vid_hdr_offset: VID header offset (%0 means default offset and this is what
++ *                  most of the users want)
++ */
++struct ubi_attach_request
++{
++	int dev_num;
++	int mtd_num;
++	const char *mtd_dev_node;
++	int vid_hdr_offset;
++};
++
++/**
++ * struct ubi_mkvol_request - volume creation request.
++ * @vol_id: ID to assign to the new volume (%UBI_VOL_NUM_AUTO should be used to
++ *          automatically assign ID)
++ * @alignment: volume alignment
++ * @bytes: volume size in bytes
++ * @vol_type: volume type (%UBI_DYNAMIC_VOLUME or %UBI_STATIC_VOLUME)
++ * @name: volume name
++ */
++struct ubi_mkvol_request
++{
++	int vol_id;
++	int alignment;
++	long long bytes;
++	int vol_type;
++	const char *name;
++};
++
++/**
++ * struct ubi_info - general UBI information.
++ * @dev_count: count of UBI devices in system
++ * @lowest_dev_num: lowest UBI device number
++ * @highest_dev_num: highest UBI device number
++ * @version: UBI version
++ * @ctrl_major: major number of the UBI control device
++ * @ctrl_minor: minor number of the UBI control device
++ */
++struct ubi_info
++{
++	int dev_count;
++	int lowest_dev_num;
++	int highest_dev_num;
++	int version;
++	int ctrl_major;
++	int ctrl_minor;
++};
++
++/**
++ * struct ubi_dev_info - UBI device information.
++ * @dev_num: UBI device number
++ * @mtd_num: MTD device number on top of which this UBI device is working
++ * @vol_count: count of volumes on this UBI device
++ * @lowest_vol_id: lowest volume ID
++ * @highest_vol_id: highest volume ID
++ * @major: major number of corresponding character device
++ * @minor: minor number of corresponding character device
++ * @total_lebs: total number of logical eraseblocks on this UBI device
++ * @avail_lebs: how many logical eraseblocks are not used and available for new
++ *             volumes
++ * @total_bytes: @total_lebs * @leb_size
++ * @avail_bytes: @avail_lebs * @leb_size
++ * @bad_count: count of bad physical eraseblocks
++ * @leb_size: logical eraseblock size
++ * @max_ec: current highest erase counter value
++ * @bad_rsvd: how many physical eraseblocks of the underlying flash device are
++ *            reserved for bad eraseblocks handling
++ * @max_vol_count: maximum possible number of volumes on this UBI device
++ * @min_io_size: minimum input/output unit size of the UBI device
++ */
++struct ubi_dev_info
++{
++	int dev_num;
++	int mtd_num;
++	int vol_count;
++	int lowest_vol_id;
++	int highest_vol_id;
++	int major;
++	int minor;
++	int total_lebs;
++	int avail_lebs;
++	long long total_bytes;
++	long long avail_bytes;
++	int bad_count;
++	int leb_size;
++	long long max_ec;
++	int bad_rsvd;
++	int max_vol_count;
++	int min_io_size;
++};
++
++/**
++ * struct ubi_vol_info - UBI volume information.
++ * @dev_num: UBI device number the volume resides on
++ * @vol_id: ID of this volume
++ * @major: major number of corresponding volume character device
++ * @minor: minor number of corresponding volume character device
++ * @type: volume type (%UBI_DYNAMIC_VOLUME or %UBI_STATIC_VOLUME)
++ * @alignment: alignment of this volume
++ * @data_bytes: how many data bytes are stored on this volume (equivalent to
++ *              @rsvd_bytes for dynamic volumes)
++ * @rsvd_bytes: how many bytes are reserved for this volume
++ * @rsvd_lebs: how many logical eraseblocks are reserved for this volume
++ * @leb_size: logical eraseblock size of this volume (may be less then
++ *            device's logical eraseblock size due to alignment)
++ * @corrupted: non-zero if the volume is corrupted
++ * @name: volume name (null-terminated)
++ */
++struct ubi_vol_info
++{
++	int dev_num;
++	int vol_id;
++	int major;
++	int minor;
++	int type;
++	int alignment;
++	long long data_bytes;
++	long long rsvd_bytes;
++	int rsvd_lebs;
++	int leb_size;
++	int corrupted;
++	char name[UBI_VOL_NAME_MAX + 1];
++};
++
++/**
++ * libubi_open - open UBI library.
++ *
++ * This function initializes and opens the UBI library and returns UBI library
++ * descriptor in case of success and %NULL in case of failure. In case of
++ * failure, errno contains the error code or zero if UBI is not present in the
++ * system.
++ */
++libubi_t libubi_open(void);
++
++/**
++ * libubi_close - close UBI library.
++ * @desc: UBI library descriptor
++ */
++void libubi_close(libubi_t desc);
++
++/**
++ * ubi_get_info - get general UBI information.
++ * @desc: UBI library descriptor
++ * @info: pointer to the &struct ubi_info object to fill
++ *
++ * This function fills the passed @info object with general UBI information and
++ * returns %0 in case of success and %-1 in case of failure.
++ */
++int ubi_get_info(libubi_t desc, struct ubi_info *info);
++
++/**
++ * mtd_num2ubi_dev - find UBI device by attached MTD device.
++ * @@desc: UBI library descriptor
++ * @mtd_num: MTD device number
++ * @dev_num: UBI device number is returned here
++ *
++ * This function finds UBI device to which MTD device @mtd_num is attached.
++ * Returns %0 if the UBI device was found and %-1 if not.
++ */
++int mtd_num2ubi_dev(libubi_t desc, int mtd_num, int *dev_num);
++
++/**
++ * ubi_attach_mtd - attach MTD device to UBI.
++ * @desc: UBI library descriptor
++ * @node: name of the UBI control character device node
++ * @req: MTD attach request.
++ *
++ * This function creates a new UBI device by attaching an MTD device as
++ * described by @req. Returns %0 in case of success and %-1 in case of failure.
++ * The newly created UBI device number is returned in @req->dev_num.
++ */
++int ubi_attach_mtd(libubi_t desc, const char *node,
++		   struct ubi_attach_request *req);
++
++/**
++ * ubi_attach - attach an MTD device by its node path.
++ * @desc: UBI library descriptor
++ * @node: name of the UBI control character device node
++ * @req: MTD attach request
++ *
++ * This function creates new UBI device by attaching an MTD device described by
++ * @req. If @req->mtd_dev_node is given it should contain path to the MTD
++ * device node. Otherwise functionality is similar than in function
++ * 'ubi_attach_mtd()' where @req->mtd_num is used.
++ *
++ * Returns %0 in case of success and %-1 in case of failure (errno is set). The
++ * newly created UBI device number is returned in @req->dev_num.
++ */
++int ubi_attach(libubi_t desc, const char *node,
++	       struct ubi_attach_request *req);
++
++/**
++ * ubi_detach_mtd - detach an MTD device.
++ * @desc: UBI library descriptor
++ * @node: name of the UBI control character device node
++ * @mtd_num: MTD device number to detach
++ *
++ * This function detaches MTD device number @mtd_num from UBI, which means the
++ * corresponding UBI device is removed. Returns zero in case of success and %-1
++ * in case of failure.
++ */
++int ubi_detach_mtd(libubi_t desc, const char *node, int mtd_num);
++
++/**
++ * ubi_detach - detach an MTD device by its node path.
++ * @desc: UBI library descriptor
++ * @node: name of the UBI control character device node
++ * @mtd_dev_node: path to an MTD device node
++ *
++ * This function detaches an MTD device @mtd_dev_node from UBI. Returns zero in
++ * case of success and %-1 in case of failure.
++ */
++int ubi_detach(libubi_t desc, const char *node, const char *mtd_dev_node);
++
++/**
++ * ubi_remove_dev - remove an UBI device.
++ * @desc: UBI library descriptor
++ * @node: name of the UBI control character device node
++ * @ubi_dev: UBI device number to remove
++ *
++ * This function removes UBI device number @ubi_dev and returns zero in case of
++ * success and %-1 in case of failure.
++ */
++int ubi_remove_dev(libubi_t desc, const char *node, int ubi_dev);
++
++/**
++ * ubi_mkvol - create an UBI volume.
++ * @desc: UBI library descriptor
++ * @node: name of the UBI character device to create a volume at
++ * @req: UBI volume creation request
++ *
++ * This function creates a UBI volume as described at @req and returns %0 in
++ * case of success and %-1 in case of failure. The assigned volume ID is
++ * returned in @req->vol_id.
++ */
++int ubi_mkvol(libubi_t desc, const char *node, struct ubi_mkvol_request *req);
++
++/**
++ * ubi_rmvol - remove a UBI volume.
++ * @desc: UBI library descriptor
++ * @node: name of the UBI character device to remove a volume from
++ * @vol_id: ID of the volume to remove
++ *
++ * This function removes volume @vol_id from UBI device @node and returns %0 in
++ * case of success and %-1 in case of failure.
++ */
++int ubi_rmvol(libubi_t desc, const char *node, int vol_id);
++
++
++/**
++ * ubi_rnvols - rename UBI volumes.
++ * @desc: UBI library descriptor
++ * @node: name of the UBI character device to remove a volume from
++ * @rnvol: description of volumes to rename
++ *
++ * This function removes volume @vol_id from UBI device @node and returns %0 in
++ * case of success and %-1 in case of failure.
++ */
++int ubi_rnvols(libubi_t desc, const char *node, struct ubi_rnvol_req *rnvol);
++
++/**
++ * ubi_rsvol - re-size UBI volume.
++ * @desc: UBI library descriptor
++ * @node: name of the UBI character device owning the volume which should be
++ *        re-sized
++ * @vol_id: volume ID to re-size
++ * @bytes: new volume size in bytes
++ *
++ * This function returns %0 in case of success and %-1 in case of error.
++ */
++int ubi_rsvol(libubi_t desc, const char *node, int vol_id, long long bytes);
++
++/**
++ * ubi_probe_node - test UBI node.
++ * @desc: UBI library descriptor
++ * @node: the node to test
++ *
++ * This function tests whether @node is a UBI device or volume node and returns
++ * %1 if this is an UBI device node, %2 if this is a volume node, and %-1 if
++ * this is not an UBI device or volume node (errno is ENODEV in this case) or
++ * if an error occurred.
++ */
++int ubi_probe_node(libubi_t desc, const char *node);
++
++/**
++ * ubi_get_dev_info - get UBI device information.
++ * @desc: UBI library descriptor
++ * @node: name of the UBI character device to fetch information about
++ * @info: pointer to the &struct ubi_dev_info object to fill
++ *
++ * This function fills the passed @info object with UBI device information and
++ * returns %0 in case of success and %-1 in case of failure. If the UBI device
++ * corresponding to @node does not exist, errno is set to @ENODEV.
++ */
++int ubi_get_dev_info(libubi_t desc, const char *node,
++		     struct ubi_dev_info *info);
++
++/**
++ * ubi_get_dev_info1 - get UBI device information.
++ * @desc: UBI library descriptor
++ * @dev_num: UBI device number to fetch information about
++ * @info: pointer to the &struct ubi_dev_info object to fill
++ *
++ * This function is identical to 'ubi_get_dev_info()' except that it accepts UBI
++ * device number, not UBI character device. If the UBI device @dev_num does not
++ * exist, errno is set to @ENODEV.
++ */
++int ubi_get_dev_info1(libubi_t desc, int dev_num, struct ubi_dev_info *info);
++
++/**
++ * ubi_get_vol_info - get UBI volume information.
++ * @desc: UBI library descriptor
++ * @node: name of the UBI volume character device to fetch information about
++ * @info: pointer to the &struct ubi_vol_info object to fill
++ *
++ * This function fills the passed @info object with UBI volume information and
++ * returns %0 in case of success and %-1 in case of failure. If the UBI volume
++ * corresponding to @node does not exist, errno is set to @ENODEV.
++ */
++int ubi_get_vol_info(libubi_t desc, const char *node,
++		     struct ubi_vol_info *info);
++
++/**
++ * ubi_get_vol_info1 - get UBI volume information.
++ * @desc: UBI library descriptor
++ * @dev_num: UBI device number
++ * @vol_id: ID of the UBI volume to fetch information about
++ * @info: pointer to the &struct ubi_vol_info object to fill
++ *
++ * This function is identical to 'ubi_get_vol_info()' except that it accepts UBI
++ * volume ID, not UBI volume character device. If the UBI device @dev_num does
++ * not exist, or if the UBI volume @vol_id does not exist, errno is set to
++ * @ENODEV.
++ */
++int ubi_get_vol_info1(libubi_t desc, int dev_num, int vol_id,
++		      struct ubi_vol_info *info);
++
++/**
++ * ubi_get_vol_info1_nm - get UBI volume information by volume name.
++ * @desc: UBI library descriptor
++ * @dev_num: UBI device number
++ * @name: name of the UBI volume to fetch information about
++ * @info: pointer to the &struct ubi_vol_info object to fill
++ *
++ * This function is identical to 'ubi_get_vol_info()' except that it accepts UBI
++ * volume name, not UBI volume ID. If the UBI device @dev_num does not exist,
++ * or if the UBI volume @name does not exist, errno is set to @ENODEV.
++ */
++int ubi_get_vol_info1_nm(libubi_t desc, int dev_num, const char *name,
++			 struct ubi_vol_info *info);
++
++/**
++ * ubi_update_start - start UBI volume update.
++ * @desc: UBI library descriptor
++ * @fd: volume character device file descriptor
++ * @bytes: how many bytes will be written to the volume
++ *
++ * This function initiates UBI volume update and returns %0 in case of success
++ * and %-1 in case of error. The caller is assumed to write @bytes data to the
++ * volume @fd afterward.
++ */
++int ubi_update_start(libubi_t desc, int fd, long long bytes);
++
++/**
++ * ubi_leb_change_start - start atomic LEB change.
++ * @desc: UBI library descriptor
++ * @fd: volume character device file descriptor
++ * @lnum: LEB number to change
++ * @bytes: how many bytes of new data will be written to the LEB
++ * @dtype: data type (%UBI_LONGTERM, %UBI_SHORTTERM, %UBI_UNKNOWN)
++ *
++ * This function initiates atomic LEB change operation and returns %0 in case
++ * of success and %-1 in case of error. he caller is assumed to write @bytes
++ * data to the volume @fd afterward.
++ */
++int ubi_leb_change_start(libubi_t desc, int fd, int lnum, int bytes, int dtype);
++
++/**
++ * ubi_set_property - set volume propety.
++ * @fd: volume character device file descriptor
++ * @property: the property to change (%UBI_PROP_DIRECT_WRITE, etc)
++ * @value: new value of the changed property
++ *
++ * This function changes a property of a volume. Returns zero in case of
++ * success and a negative error code in case of error.
++ */
++int ubi_set_property(int fd, uint8_t property, uint64_t value);
++
++/**
++ * ubi_leb_unmap - unmap a logical eraseblock.
++ * @fd: volume character device file descriptor
++ * @lnum: logical eraseblock to unmap
++ *
++ * This function unmaps LEB @lnum and returns zero in case of success and a
++ * negative error code in case of error.
++ */
++int ubi_leb_unmap(int fd, int lnum);
++
++/**
++ * ubi_is_mapped - check if logical eraseblock is mapped.
++ * @fd: volume character device file descriptor
++ * @lnum: logical eraseblock number
++ *
++ * This function checks if logical eraseblock @lnum is mapped to a physical
++ * eraseblock. If a logical eraseblock is un-mapped, this does not necessarily
++ * mean it will still be un-mapped after the UBI device is re-attached. The
++ * logical eraseblock may become mapped to the physical eraseblock it was last
++ * mapped to.
++ *
++ * This function returns %1 if the LEB is mapped, %0 if not, and %-1 in case of
++ * failure. If the volume is damaged because of an interrupted update errno
++ * set with %EBADF error code.
++ */
++int ubi_is_mapped(int fd, int lnum);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* !__LIBUBI_H__ */
+diff --git a/ubi/include/libubi_int.h b/ubi/include/libubi_int.h
+new file mode 100644
+index 0000000..c3aa37a
+--- /dev/null
++++ b/ubi/include/libubi_int.h
+@@ -0,0 +1,131 @@
++/*
++ * Copyright (c) International Business Machines Corp., 2006
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
++ * the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ *
++ * Author: Artem Bityutskiy
++ *
++ * UBI (Unsorted Block Images) library.
++ */
++
++#ifndef __LIBUBI_INT_H__
++#define __LIBUBI_INT_H__
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*
++ * The below are pre-define UBI file and directory names.
++ *
++ * Note, older kernels put 'ubiX_Y' directories straight to '/sys/class/ubi/'.
++ * New kernels puts 'ubiX_Y' directories to '/sys/class/ubi/ubiX/', which is
++ * saner. And for compatibility reasons it also puts symlinks to 'ubiX_Y'
++ * directories to '/sys/class/ubi/'. For now libubi assumes old layout.
++ */
++
++#define SYSFS_UBI         "class/ubi"
++#define SYSFS_CTRL        "class/misc/ubi_ctrl/"
++
++#define CTRL_DEV          "dev"
++
++#define UBI_VER           "version"
++#define UBI_DEV_NAME_PATT "ubi%d"
++
++#define DEV_DEV           "dev"
++#define DEV_AVAIL_EBS     "avail_eraseblocks"
++#define DEV_TOTAL_EBS     "total_eraseblocks"
++#define DEV_BAD_COUNT     "bad_peb_count"
++#define DEV_EB_SIZE       "eraseblock_size"
++#define DEV_MAX_EC        "max_ec"
++#define DEV_MAX_RSVD      "reserved_for_bad"
++#define DEV_MAX_VOLS      "max_vol_count"
++#define DEV_MIN_IO_SIZE   "min_io_size"
++#define DEV_MTD_NUM       "mtd_num"
++
++#define UBI_VOL_NAME_PATT "ubi%d_%d"
++#define VOL_TYPE          "type"
++#define VOL_DEV           "dev"
++#define VOL_ALIGNMENT     "alignment"
++#define VOL_DATA_BYTES    "data_bytes"
++#define VOL_RSVD_EBS      "reserved_ebs"
++#define VOL_EB_SIZE       "usable_eb_size"
++#define VOL_CORRUPTED     "corrupted"
++#define VOL_NAME          "name"
++
++/**
++ * libubi - UBI library description data structure.
++ * @sysfs: sysfs file system path
++ * @sysfs_ctrl: UBI control device directory in sysfs
++ * @ctrl_dev: UBI control device major/minor numbers sysfs file
++ * @sysfs_ubi: UBI directory in sysfs
++ * @ubi_dev: UBI device sysfs directory pattern
++ * @ubi_version: UBI version file sysfs path
++ * @dev_dev: UBI device major/minor numbers file pattern
++ * @dev_avail_ebs: count of available eraseblocks sysfs path pattern
++ * @dev_total_ebs: total eraseblocks count sysfs path pattern
++ * @dev_bad_count: count of bad eraseblocks sysfs path pattern
++ * @dev_eb_size: size of UBI device's eraseblocks sysfs path pattern
++ * @dev_max_ec: maximum erase counter sysfs path pattern
++ * @dev_bad_rsvd: count of physical eraseblock reserved for bad eraseblocks
++ *                handling
++ * @dev_max_vols: maximum volumes number count sysfs path pattern
++ * @dev_min_io_size: minimum I/O unit size sysfs path pattern
++ * @dev_mtd_num: MTD device number
++ * @ubi_vol: UBI volume sysfs directory pattern
++ * @vol_type: volume type sysfs path pattern
++ * @vol_dev: volume major/minor numbers file pattern
++ * @vol_alignment: volume alignment sysfs path pattern
++ * @vol_data_bytes: volume data size sysfs path pattern
++ * @vol_rsvd_ebs: volume reserved size sysfs path pattern
++ * @vol_eb_size: volume eraseblock size sysfs path pattern
++ * @vol_corrupted: volume corruption flag sysfs path pattern
++ * @vol_name: volume name sysfs path pattern
++ */
++struct libubi
++{
++	char *sysfs;
++	char *sysfs_ctrl;
++	char *ctrl_dev;
++	char *sysfs_ubi;
++	char *ubi_dev;
++	char *ubi_version;
++	char *dev_dev;
++	char *dev_avail_ebs;
++	char *dev_total_ebs;
++	char *dev_bad_count;
++	char *dev_eb_size;
++	char *dev_max_ec;
++	char *dev_bad_rsvd;
++	char *dev_max_vols;
++	char *dev_min_io_size;
++	char *dev_mtd_num;
++	char *ubi_vol;
++	char *vol_type;
++	char *vol_dev;
++	char *vol_alignment;
++	char *vol_data_bytes;
++	char *vol_rsvd_ebs;
++	char *vol_eb_size;
++	char *vol_corrupted;
++	char *vol_name;
++	char *vol_max_count;
++};
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* !__LIBUBI_INT_H__ */
+diff --git a/ubi/include/mtd/mtd-abi.h b/ubi/include/mtd/mtd-abi.h
+new file mode 100644
+index 0000000..c6954ed
+--- /dev/null
++++ b/ubi/include/mtd/mtd-abi.h
+@@ -0,0 +1,167 @@
++/*
++ * Portions of MTD ABI definition which are shared by kernel and user space
++ */
++
++#ifndef __MTD_ABI_H__
++#define __MTD_ABI_H__
++
++#include <linux/types.h>
++
++struct erase_info_user {
++	__u32 start;
++	__u32 length;
++};
++
++struct erase_info_user64 {
++	__u64 start;
++	__u64 length;
++};
++
++struct mtd_oob_buf {
++	__u32 start;
++	__u32 length;
++	unsigned char *ptr;
++};
++
++struct mtd_oob_buf64 {
++	__u64 start;
++	__u32 pad;
++	__u32 length;
++	__u64 usr_ptr;
++};
++
++#define MTD_ABSENT		0
++#define MTD_RAM			1
++#define MTD_ROM			2
++#define MTD_NORFLASH		3
++#define MTD_NANDFLASH		4
++#define MTD_DATAFLASH		6
++#define MTD_UBIVOLUME		7
++
++#define MTD_WRITEABLE		0x400	/* Device is writeable */
++#define MTD_BIT_WRITEABLE	0x800	/* Single bits can be flipped */
++#define MTD_NO_ERASE		0x1000	/* No erase necessary */
++#define MTD_POWERUP_LOCK	0x2000	/* Always locked after reset */
++
++// Some common devices / combinations of capabilities
++#define MTD_CAP_ROM		0
++#define MTD_CAP_RAM		(MTD_WRITEABLE | MTD_BIT_WRITEABLE | MTD_NO_ERASE)
++#define MTD_CAP_NORFLASH	(MTD_WRITEABLE | MTD_BIT_WRITEABLE)
++#define MTD_CAP_NANDFLASH	(MTD_WRITEABLE)
++
++/* ECC byte placement */
++#define MTD_NANDECC_OFF		0	// Switch off ECC (Not recommended)
++#define MTD_NANDECC_PLACE	1	// Use the given placement in the structure (YAFFS1 legacy mode)
++#define MTD_NANDECC_AUTOPLACE	2	// Use the default placement scheme
++#define MTD_NANDECC_PLACEONLY	3	// Use the given placement in the structure (Do not store ecc result on read)
++#define MTD_NANDECC_AUTOPL_USR 	4	// Use the given autoplacement scheme rather than using the default
++
++/* OTP mode selection */
++#define MTD_OTP_OFF		0
++#define MTD_OTP_FACTORY		1
++#define MTD_OTP_USER		2
++
++struct mtd_info_user {
++	__u8 type;
++	__u32 flags;
++	__u32 size;	 // Total size of the MTD
++	__u32 erasesize;
++	__u32 writesize;
++	__u32 oobsize;   // Amount of OOB data per block (e.g. 16)
++	/* The below two fields are obsolete and broken, do not use them
++	 * (TODO: remove at some point) */
++	__u32 ecctype;
++	__u32 eccsize;
++};
++
++struct region_info_user {
++	__u32 offset;		/* At which this region starts,
++					 * from the beginning of the MTD */
++	__u32 erasesize;		/* For this region */
++	__u32 numblocks;		/* Number of blocks in this region */
++	__u32 regionindex;
++};
++
++struct otp_info {
++	__u32 start;
++	__u32 length;
++	__u32 locked;
++};
++
++#define MEMGETINFO		_IOR('M', 1, struct mtd_info_user)
++#define MEMERASE		_IOW('M', 2, struct erase_info_user)
++#define MEMWRITEOOB		_IOWR('M', 3, struct mtd_oob_buf)
++#define MEMREADOOB		_IOWR('M', 4, struct mtd_oob_buf)
++#define MEMLOCK			_IOW('M', 5, struct erase_info_user)
++#define MEMUNLOCK		_IOW('M', 6, struct erase_info_user)
++#define MEMGETREGIONCOUNT	_IOR('M', 7, int)
++#define MEMGETREGIONINFO	_IOWR('M', 8, struct region_info_user)
++#define MEMSETOOBSEL		_IOW('M', 9, struct nand_oobinfo)
++#define MEMGETOOBSEL		_IOR('M', 10, struct nand_oobinfo)
++#define MEMGETBADBLOCK		_IOW('M', 11, __kernel_loff_t)
++#define MEMSETBADBLOCK		_IOW('M', 12, __kernel_loff_t)
++#define OTPSELECT		_IOR('M', 13, int)
++#define OTPGETREGIONCOUNT	_IOW('M', 14, int)
++#define OTPGETREGIONINFO	_IOW('M', 15, struct otp_info)
++#define OTPLOCK			_IOR('M', 16, struct otp_info)
++#define ECCGETLAYOUT		_IOR('M', 17, struct nand_ecclayout)
++#define ECCGETSTATS		_IOR('M', 18, struct mtd_ecc_stats)
++#define MTDFILEMODE		_IO('M', 19)
++#define MEMERASE64		_IOW('M', 20, struct erase_info_user64)
++#define MEMWRITEOOB64		_IOWR('M', 21, struct mtd_oob_buf64)
++#define MEMREADOOB64		_IOWR('M', 22, struct mtd_oob_buf64)
++
++/*
++ * Obsolete legacy interface. Keep it in order not to break userspace
++ * interfaces
++ */
++struct nand_oobinfo {
++	__u32 useecc;
++	__u32 eccbytes;
++	__u32 oobfree[8][2];
++	__u32 eccpos[32];
++};
++
++struct nand_oobfree {
++	__u32 offset;
++	__u32 length;
++};
++
++#define MTD_MAX_OOBFREE_ENTRIES	8
++/*
++ * ECC layout control structure. Exported to userspace for
++ * diagnosis and to allow creation of raw images
++ */
++struct nand_ecclayout {
++	__u32 eccbytes;
++	__u32 eccpos[64];
++	__u32 oobavail;
++	struct nand_oobfree oobfree[MTD_MAX_OOBFREE_ENTRIES];
++};
++
++/**
++ * struct mtd_ecc_stats - error correction stats
++ *
++ * @corrected:	number of corrected bits
++ * @failed:	number of uncorrectable errors
++ * @badblocks:	number of bad blocks in this partition
++ * @bbtblocks:	number of blocks reserved for bad block tables
++ */
++struct mtd_ecc_stats {
++	__u32 corrected;
++	__u32 failed;
++	__u32 badblocks;
++	__u32 bbtblocks;
++};
++
++/*
++ * Read/write file modes for access to MTD
++ */
++enum mtd_file_modes {
++	MTD_MODE_NORMAL = MTD_OTP_OFF,
++	MTD_MODE_OTP_FACTORY = MTD_OTP_FACTORY,
++	MTD_MODE_OTP_USER = MTD_OTP_USER,
++	MTD_MODE_RAW,
++};
++
++#endif /* __MTD_ABI_H__ */
+diff --git a/ubi/include/mtd/mtd-user.h b/ubi/include/mtd/mtd-user.h
+new file mode 100644
+index 0000000..b496159
+--- /dev/null
++++ b/ubi/include/mtd/mtd-user.h
+@@ -0,0 +1,21 @@
++/*
++ * $Id: mtd-user.h,v 1.2 2004/05/05 14:44:57 dwmw2 Exp $
++ *
++ * MTD ABI header for use by user space only.
++ */
++
++#ifndef __MTD_USER_H__
++#define __MTD_USER_H__
++
++#include <stdint.h>
++
++/* This file is blessed for inclusion by userspace */
++#include "mtd/mtd-abi.h"
++
++typedef struct mtd_info_user mtd_info_t;
++typedef struct erase_info_user erase_info_t;
++typedef struct region_info_user region_info_t;
++typedef struct nand_oobinfo nand_oobinfo_t;
++typedef struct nand_ecclayout nand_ecclayout_t;
++
++#endif /* __MTD_USER_H__ */
+diff --git a/ubi/include/mtd/ubi-media.h b/ubi/include/mtd/ubi-media.h
+new file mode 100644
+index 0000000..08bec3e
+--- /dev/null
++++ b/ubi/include/mtd/ubi-media.h
+@@ -0,0 +1,378 @@
++/*
++ * Copyright (c) International Business Machines Corp., 2006
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
++ * the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++ *
++ * Authors: Artem Bityutskiy (Битюцкий Артём)
++ *          Thomas Gleixner
++ *          Frank Haverkamp
++ *          Oliver Lohmann
++ *          Andreas Arnez
++ */
++
++/*
++ * This file defines the layout of UBI headers and all the other UBI on-flash
++ * data structures.
++ */
++
++#ifndef __UBI_MEDIA_H__
++#define __UBI_MEDIA_H__
++
++#include <asm/byteorder.h>
++
++/* The version of UBI images supported by this implementation */
++#define UBI_VERSION 1
++
++/* The highest erase counter value supported by this implementation */
++#define UBI_MAX_ERASECOUNTER 0x7FFFFFFF
++
++/* The initial CRC32 value used when calculating CRC checksums */
++#define UBI_CRC32_INIT 0xFFFFFFFFU
++
++/* Erase counter header magic number (ASCII "UBI#") */
++#define UBI_EC_HDR_MAGIC  0x55424923
++/* Volume identifier header magic number (ASCII "UBI!") */
++#define UBI_VID_HDR_MAGIC 0x55424921
++
++/*
++ * Volume type constants used in the volume identifier header.
++ *
++ * @UBI_VID_DYNAMIC: dynamic volume
++ * @UBI_VID_STATIC: static volume
++ */
++enum {
++	UBI_VID_DYNAMIC = 1,
++	UBI_VID_STATIC  = 2
++};
++
++/*
++ * Volume flags used in the volume table record.
++ *
++ * @UBI_VTBL_AUTORESIZE_FLG: auto-resize this volume
++ *
++ * %UBI_VTBL_AUTORESIZE_FLG flag can be set only for one volume in the volume
++ * table. UBI automatically re-sizes the volume which has this flag and makes
++ * the volume to be of largest possible size. This means that if after the
++ * initialization UBI finds out that there are available physical eraseblocks
++ * present on the device, it automatically appends all of them to the volume
++ * (the physical eraseblocks reserved for bad eraseblocks handling and other
++ * reserved physical eraseblocks are not taken). So, if there is a volume with
++ * the %UBI_VTBL_AUTORESIZE_FLG flag set, the amount of available logical
++ * eraseblocks will be zero after UBI is loaded, because all of them will be
++ * reserved for this volume. Note, the %UBI_VTBL_AUTORESIZE_FLG bit is cleared
++ * after the volume had been initialized.
++ *
++ * The auto-resize feature is useful for device production purposes. For
++ * example, different NAND flash chips may have different amount of initial bad
++ * eraseblocks, depending of particular chip instance. Manufacturers of NAND
++ * chips usually guarantee that the amount of initial bad eraseblocks does not
++ * exceed certain percent, e.g. 2%. When one creates an UBI image which will be
++ * flashed to the end devices in production, he does not know the exact amount
++ * of good physical eraseblocks the NAND chip on the device will have, but this
++ * number is required to calculate the volume sized and put them to the volume
++ * table of the UBI image. In this case, one of the volumes (e.g., the one
++ * which will store the root file system) is marked as "auto-resizable", and
++ * UBI will adjust its size on the first boot if needed.
++ *
++ * Note, first UBI reserves some amount of physical eraseblocks for bad
++ * eraseblock handling, and then re-sizes the volume, not vice-versa. This
++ * means that the pool of reserved physical eraseblocks will always be present.
++ */
++enum {
++	UBI_VTBL_AUTORESIZE_FLG = 0x01,
++};
++
++/*
++ * Compatibility constants used by internal volumes.
++ *
++ * @UBI_COMPAT_DELETE: delete this internal volume before anything is written
++ *                     to the flash
++ * @UBI_COMPAT_RO: attach this device in read-only mode
++ * @UBI_COMPAT_PRESERVE: preserve this internal volume - do not touch its
++ *                       physical eraseblocks, don't allow the wear-leveling
++ *                       sub-system to move them
++ * @UBI_COMPAT_REJECT: reject this UBI image
++ */
++enum {
++	UBI_COMPAT_DELETE   = 1,
++	UBI_COMPAT_RO       = 2,
++	UBI_COMPAT_PRESERVE = 4,
++	UBI_COMPAT_REJECT   = 5
++};
++
++/* Sizes of UBI headers */
++#define UBI_EC_HDR_SIZE  sizeof(struct ubi_ec_hdr)
++#define UBI_VID_HDR_SIZE sizeof(struct ubi_vid_hdr)
++
++/* Sizes of UBI headers without the ending CRC */
++#define UBI_EC_HDR_SIZE_CRC  (UBI_EC_HDR_SIZE  - sizeof(__be32))
++#define UBI_VID_HDR_SIZE_CRC (UBI_VID_HDR_SIZE - sizeof(__be32))
++
++/**
++ * struct ubi_ec_hdr - UBI erase counter header.
++ * @magic: erase counter header magic number (%UBI_EC_HDR_MAGIC)
++ * @version: version of UBI implementation which is supposed to accept this
++ *           UBI image
++ * @padding1: reserved for future, zeroes
++ * @ec: the erase counter
++ * @vid_hdr_offset: where the VID header starts
++ * @data_offset: where the user data start
++ * @image_seq: image sequence number
++ * @padding2: reserved for future, zeroes
++ * @hdr_crc: erase counter header CRC checksum
++ *
++ * The erase counter header takes 64 bytes and has a plenty of unused space for
++ * future usage. The unused fields are zeroed. The @version field is used to
++ * indicate the version of UBI implementation which is supposed to be able to
++ * work with this UBI image. If @version is greater than the current UBI
++ * version, the image is rejected. This may be useful in future if something
++ * is changed radically. This field is duplicated in the volume identifier
++ * header.
++ *
++ * The @vid_hdr_offset and @data_offset fields contain the offset of the the
++ * volume identifier header and user data, relative to the beginning of the
++ * physical eraseblock. These values have to be the same for all physical
++ * eraseblocks.
++ *
++ * The @image_seq field is used to validate a UBI image that has been prepared
++ * for a UBI device. The @image_seq value can be any value, but it must be the
++ * same on all eraseblocks. UBI will ensure that all new erase counter headers
++ * also contain this value, and will check the value when scanning at start-up.
++ * One way to make use of @image_seq is to increase its value by one every time
++ * an image is flashed over an existing image, then, if the flashing does not
++ * complete, UBI will detect the error when scanning.
++ */
++struct ubi_ec_hdr {
++	__be32  magic;
++	__u8    version;
++	__u8    padding1[3];
++	__be64  ec; /* Warning: the current limit is 31-bit anyway! */
++	__be32  vid_hdr_offset;
++	__be32  data_offset;
++	__be32  image_seq;
++	__u8    padding2[32];
++	__be32  hdr_crc;
++} __attribute__ ((packed));
++
++/**
++ * struct ubi_vid_hdr - on-flash UBI volume identifier header.
++ * @magic: volume identifier header magic number (%UBI_VID_HDR_MAGIC)
++ * @version: UBI implementation version which is supposed to accept this UBI
++ *           image (%UBI_VERSION)
++ * @vol_type: volume type (%UBI_VID_DYNAMIC or %UBI_VID_STATIC)
++ * @copy_flag: if this logical eraseblock was copied from another physical
++ *             eraseblock (for wear-leveling reasons)
++ * @compat: compatibility of this volume (%0, %UBI_COMPAT_DELETE,
++ *          %UBI_COMPAT_IGNORE, %UBI_COMPAT_PRESERVE, or %UBI_COMPAT_REJECT)
++ * @vol_id: ID of this volume
++ * @lnum: logical eraseblock number
++ * @padding1: reserved for future, zeroes
++ * @data_size: how many bytes of data this logical eraseblock contains
++ * @used_ebs: total number of used logical eraseblocks in this volume
++ * @data_pad: how many bytes at the end of this physical eraseblock are not
++ *            used
++ * @data_crc: CRC checksum of the data stored in this logical eraseblock
++ * @padding2: reserved for future, zeroes
++ * @sqnum: sequence number
++ * @padding3: reserved for future, zeroes
++ * @hdr_crc: volume identifier header CRC checksum
++ *
++ * The @sqnum is the value of the global sequence counter at the time when this
++ * VID header was created. The global sequence counter is incremented each time
++ * UBI writes a new VID header to the flash, i.e. when it maps a logical
++ * eraseblock to a new physical eraseblock. The global sequence counter is an
++ * unsigned 64-bit integer and we assume it never overflows. The @sqnum
++ * (sequence number) is used to distinguish between older and newer versions of
++ * logical eraseblocks.
++ *
++ * There are 2 situations when there may be more than one physical eraseblock
++ * corresponding to the same logical eraseblock, i.e., having the same @vol_id
++ * and @lnum values in the volume identifier header. Suppose we have a logical
++ * eraseblock L and it is mapped to the physical eraseblock P.
++ *
++ * 1. Because UBI may erase physical eraseblocks asynchronously, the following
++ * situation is possible: L is asynchronously erased, so P is scheduled for
++ * erasure, then L is written to,i.e. mapped to another physical eraseblock P1,
++ * so P1 is written to, then an unclean reboot happens. Result - there are 2
++ * physical eraseblocks P and P1 corresponding to the same logical eraseblock
++ * L. But P1 has greater sequence number, so UBI picks P1 when it attaches the
++ * flash.
++ *
++ * 2. From time to time UBI moves logical eraseblocks to other physical
++ * eraseblocks for wear-leveling reasons. If, for example, UBI moves L from P
++ * to P1, and an unclean reboot happens before P is physically erased, there
++ * are two physical eraseblocks P and P1 corresponding to L and UBI has to
++ * select one of them when the flash is attached. The @sqnum field says which
++ * PEB is the original (obviously P will have lower @sqnum) and the copy. But
++ * it is not enough to select the physical eraseblock with the higher sequence
++ * number, because the unclean reboot could have happen in the middle of the
++ * copying process, so the data in P is corrupted. It is also not enough to
++ * just select the physical eraseblock with lower sequence number, because the
++ * data there may be old (consider a case if more data was added to P1 after
++ * the copying). Moreover, the unclean reboot may happen when the erasure of P
++ * was just started, so it result in unstable P, which is "mostly" OK, but
++ * still has unstable bits.
++ *
++ * UBI uses the @copy_flag field to indicate that this logical eraseblock is a
++ * copy. UBI also calculates data CRC when the data is moved and stores it at
++ * the @data_crc field of the copy (P1). So when UBI needs to pick one physical
++ * eraseblock of two (P or P1), the @copy_flag of the newer one (P1) is
++ * examined. If it is cleared, the situation* is simple and the newer one is
++ * picked. If it is set, the data CRC of the copy (P1) is examined. If the CRC
++ * checksum is correct, this physical eraseblock is selected (P1). Otherwise
++ * the older one (P) is selected.
++ *
++ * There are 2 sorts of volumes in UBI: user volumes and internal volumes.
++ * Internal volumes are not seen from outside and are used for various internal
++ * UBI purposes. In this implementation there is only one internal volume - the
++ * layout volume. Internal volumes are the main mechanism of UBI extensions.
++ * For example, in future one may introduce a journal internal volume. Internal
++ * volumes have their own reserved range of IDs.
++ *
++ * The @compat field is only used for internal volumes and contains the "degree
++ * of their compatibility". It is always zero for user volumes. This field
++ * provides a mechanism to introduce UBI extensions and to be still compatible
++ * with older UBI binaries. For example, if someone introduced a journal in
++ * future, he would probably use %UBI_COMPAT_DELETE compatibility for the
++ * journal volume.  And in this case, older UBI binaries, which know nothing
++ * about the journal volume, would just delete this volume and work perfectly
++ * fine. This is similar to what Ext2fs does when it is fed by an Ext3fs image
++ * - it just ignores the Ext3fs journal.
++ *
++ * The @data_crc field contains the CRC checksum of the contents of the logical
++ * eraseblock if this is a static volume. In case of dynamic volumes, it does
++ * not contain the CRC checksum as a rule. The only exception is when the
++ * data of the physical eraseblock was moved by the wear-leveling sub-system,
++ * then the wear-leveling sub-system calculates the data CRC and stores it in
++ * the @data_crc field. And of course, the @copy_flag is %in this case.
++ *
++ * The @data_size field is used only for static volumes because UBI has to know
++ * how many bytes of data are stored in this eraseblock. For dynamic volumes,
++ * this field usually contains zero. The only exception is when the data of the
++ * physical eraseblock was moved to another physical eraseblock for
++ * wear-leveling reasons. In this case, UBI calculates CRC checksum of the
++ * contents and uses both @data_crc and @data_size fields. In this case, the
++ * @data_size field contains data size.
++ *
++ * The @used_ebs field is used only for static volumes and indicates how many
++ * eraseblocks the data of the volume takes. For dynamic volumes this field is
++ * not used and always contains zero.
++ *
++ * The @data_pad is calculated when volumes are created using the alignment
++ * parameter. So, effectively, the @data_pad field reduces the size of logical
++ * eraseblocks of this volume. This is very handy when one uses block-oriented
++ * software (say, cramfs) on top of the UBI volume.
++ */
++struct ubi_vid_hdr {
++	__be32  magic;
++	__u8    version;
++	__u8    vol_type;
++	__u8    copy_flag;
++	__u8    compat;
++	__be32  vol_id;
++	__be32  lnum;
++	__be32  leb_ver;
++	__be32  data_size;
++	__be32  used_ebs;
++	__be32  data_pad;
++	__be32  data_crc;
++	__u8    padding2[4];
++	__be64  sqnum;
++	__u8    padding3[12];
++	__be32  hdr_crc;
++} __attribute__ ((packed));
++
++/* Internal UBI volumes count */
++#define UBI_INT_VOL_COUNT 1
++
++/*
++ * Starting ID of internal volumes. There is reserved room for 4096 internal
++ * volumes.
++ */
++#define UBI_INTERNAL_VOL_START (0x7FFFFFFF - 4096)
++
++/* The layout volume contains the volume table */
++
++#define UBI_LAYOUT_VOLUME_ID     UBI_INTERNAL_VOL_START
++#define UBI_LAYOUT_VOLUME_TYPE   UBI_VID_DYNAMIC
++#define UBI_LAYOUT_VOLUME_ALIGN  1
++#define UBI_LAYOUT_VOLUME_EBS    2
++#define UBI_LAYOUT_VOLUME_NAME   "layout volume"
++#define UBI_LAYOUT_VOLUME_COMPAT UBI_COMPAT_REJECT
++
++/* The maximum number of volumes per one UBI device */
++#define UBI_MAX_VOLUMES 128
++
++/* The maximum volume name length */
++#define UBI_VOL_NAME_MAX 127
++
++/* Size of the volume table record */
++#define UBI_VTBL_RECORD_SIZE sizeof(struct ubi_vtbl_record)
++
++/* Size of the volume table record without the ending CRC */
++#define UBI_VTBL_RECORD_SIZE_CRC (UBI_VTBL_RECORD_SIZE - sizeof(__be32))
++
++/**
++ * struct ubi_vtbl_record - a record in the volume table.
++ * @reserved_pebs: how many physical eraseblocks are reserved for this volume
++ * @alignment: volume alignment
++ * @data_pad: how many bytes are unused at the end of the each physical
++ * eraseblock to satisfy the requested alignment
++ * @vol_type: volume type (%UBI_DYNAMIC_VOLUME or %UBI_STATIC_VOLUME)
++ * @upd_marker: if volume update was started but not finished
++ * @name_len: volume name length
++ * @name: the volume name
++ * @flags: volume flags (%UBI_VTBL_AUTORESIZE_FLG)
++ * @padding: reserved, zeroes
++ * @crc: a CRC32 checksum of the record
++ *
++ * The volume table records are stored in the volume table, which is stored in
++ * the layout volume. The layout volume consists of 2 logical eraseblock, each
++ * of which contains a copy of the volume table (i.e., the volume table is
++ * duplicated). The volume table is an array of &struct ubi_vtbl_record
++ * objects indexed by the volume ID.
++ *
++ * If the size of the logical eraseblock is large enough to fit
++ * %UBI_MAX_VOLUMES records, the volume table contains %UBI_MAX_VOLUMES
++ * records. Otherwise, it contains as many records as it can fit (i.e., size of
++ * logical eraseblock divided by sizeof(struct ubi_vtbl_record)).
++ *
++ * The @upd_marker flag is used to implement volume update. It is set to %1
++ * before update and set to %0 after the update. So if the update operation was
++ * interrupted, UBI knows that the volume is corrupted.
++ *
++ * The @alignment field is specified when the volume is created and cannot be
++ * later changed. It may be useful, for example, when a block-oriented file
++ * system works on top of UBI. The @data_pad field is calculated using the
++ * logical eraseblock size and @alignment. The alignment must be multiple to the
++ * minimal flash I/O unit. If @alignment is 1, all the available space of
++ * the physical eraseblocks is used.
++ *
++ * Empty records contain all zeroes and the CRC checksum of those zeroes.
++ */
++struct ubi_vtbl_record {
++	__be32  reserved_pebs;
++	__be32  alignment;
++	__be32  data_pad;
++	__u8    vol_type;
++	__u8    upd_marker;
++	__be16  name_len;
++	__u8    name[UBI_VOL_NAME_MAX+1];
++	__u8    flags;
++	__u8    padding[23];
++	__be32  crc;
++} __attribute__ ((packed));
++
++#endif /* !__UBI_MEDIA_H__ */
+diff --git a/ubi/include/mtd/ubi-user.h b/ubi/include/mtd/ubi-user.h
+new file mode 100644
+index 0000000..296efae
+--- /dev/null
++++ b/ubi/include/mtd/ubi-user.h
+@@ -0,0 +1,410 @@
++/*
++ * Copyright (c) International Business Machines Corp., 2006
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
++ * the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++ *
++ * Author: Artem Bityutskiy (Битюцкий Артём)
++ */
++
++#ifndef __UBI_USER_H__
++#define __UBI_USER_H__
++
++/*
++ * UBI device creation (the same as MTD device attachment)
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ * MTD devices may be attached using %UBI_IOCATT ioctl command of the UBI
++ * control device. The caller has to properly fill and pass
++ * &struct ubi_attach_req object - UBI will attach the MTD device specified in
++ * the request and return the newly created UBI device number as the ioctl
++ * return value.
++ *
++ * UBI device deletion (the same as MTD device detachment)
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ * An UBI device maybe deleted with %UBI_IOCDET ioctl command of the UBI
++ * control device.
++ *
++ * UBI volume creation
++ * ~~~~~~~~~~~~~~~~~~~
++ *
++ * UBI volumes are created via the %UBI_IOCMKVOL ioctl command of UBI character
++ * device. A &struct ubi_mkvol_req object has to be properly filled and a
++ * pointer to it has to be passed to the ioctl.
++ *
++ * UBI volume deletion
++ * ~~~~~~~~~~~~~~~~~~~
++ *
++ * To delete a volume, the %UBI_IOCRMVOL ioctl command of the UBI character
++ * device should be used. A pointer to the 32-bit volume ID hast to be passed
++ * to the ioctl.
++ *
++ * UBI volume re-size
++ * ~~~~~~~~~~~~~~~~~~
++ *
++ * To re-size a volume, the %UBI_IOCRSVOL ioctl command of the UBI character
++ * device should be used. A &struct ubi_rsvol_req object has to be properly
++ * filled and a pointer to it has to be passed to the ioctl.
++ *
++ * UBI volumes re-name
++ * ~~~~~~~~~~~~~~~~~~~
++ *
++ * To re-name several volumes atomically at one go, the %UBI_IOCRNVOL command
++ * of the UBI character device should be used. A &struct ubi_rnvol_req object
++ * has to be properly filled and a pointer to it has to be passed to the ioctl.
++ *
++ * UBI volume update
++ * ~~~~~~~~~~~~~~~~~
++ *
++ * Volume update should be done via the %UBI_IOCVOLUP ioctl command of the
++ * corresponding UBI volume character device. A pointer to a 64-bit update
++ * size should be passed to the ioctl. After this, UBI expects user to write
++ * this number of bytes to the volume character device. The update is finished
++ * when the claimed number of bytes is passed. So, the volume update sequence
++ * is something like:
++ *
++ * fd = open("/dev/my_volume");
++ * ioctl(fd, UBI_IOCVOLUP, &image_size);
++ * write(fd, buf, image_size);
++ * close(fd);
++ *
++ * Logical eraseblock erase
++ * ~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ * To erase a logical eraseblock, the %UBI_IOCEBER ioctl command of the
++ * corresponding UBI volume character device should be used. This command
++ * unmaps the requested logical eraseblock, makes sure the corresponding
++ * physical eraseblock is successfully erased, and returns.
++ *
++ * Atomic logical eraseblock change
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ * Atomic logical eraseblock change operation is called using the %UBI_IOCEBCH
++ * ioctl command of the corresponding UBI volume character device. A pointer to
++ * a &struct ubi_leb_change_req object has to be passed to the ioctl. Then the
++ * user is expected to write the requested amount of bytes (similarly to what
++ * should be done in case of the "volume update" ioctl).
++ *
++ * Logical eraseblock map
++ * ~~~~~~~~~~~~~~~~~~~~~
++ *
++ * To map a logical eraseblock to a physical eraseblock, the %UBI_IOCEBMAP
++ * ioctl command should be used. A pointer to a &struct ubi_map_req object is
++ * expected to be passed. The ioctl maps the requested logical eraseblock to
++ * a physical eraseblock and returns.  Only non-mapped logical eraseblocks can
++ * be mapped. If the logical eraseblock specified in the request is already
++ * mapped to a physical eraseblock, the ioctl fails and returns error.
++ *
++ * Logical eraseblock unmap
++ * ~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ * To unmap a logical eraseblock to a physical eraseblock, the %UBI_IOCEBUNMAP
++ * ioctl command should be used. The ioctl unmaps the logical eraseblocks,
++ * schedules corresponding physical eraseblock for erasure, and returns. Unlike
++ * the "LEB erase" command, it does not wait for the physical eraseblock being
++ * erased. Note, the side effect of this is that if an unclean reboot happens
++ * after the unmap ioctl returns, you may find the LEB mapped again to the same
++ * physical eraseblock after the UBI is run again.
++ *
++ * Check if logical eraseblock is mapped
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ * To check if a logical eraseblock is mapped to a physical eraseblock, the
++ * %UBI_IOCEBISMAP ioctl command should be used. It returns %0 if the LEB is
++ * not mapped, and %1 if it is mapped.
++ *
++ * Set an UBI volume property
++ * ~~~~~~~~~~~~~~~~~~~~~~~~~
++ *
++ * To set an UBI volume property the %UBI_IOCSETPROP ioctl command should be
++ * used. A pointer to a &struct ubi_set_prop_req object is expected to be
++ * passed. The object describes which property should be set, and to which value
++ * it should be set.
++ */
++
++/*
++ * When a new UBI volume or UBI device is created, users may either specify the
++ * volume/device number they want to create or to let UBI automatically assign
++ * the number using these constants.
++ */
++#define UBI_VOL_NUM_AUTO (-1)
++#define UBI_DEV_NUM_AUTO (-1)
++
++/* Maximum volume name length */
++#define UBI_MAX_VOLUME_NAME 127
++
++/* ioctl commands of UBI character devices */
++
++#define UBI_IOC_MAGIC 'o'
++
++/* Create an UBI volume */
++#define UBI_IOCMKVOL _IOW(UBI_IOC_MAGIC, 0, struct ubi_mkvol_req)
++/* Remove an UBI volume */
++#define UBI_IOCRMVOL _IOW(UBI_IOC_MAGIC, 1, int32_t)
++/* Re-size an UBI volume */
++#define UBI_IOCRSVOL _IOW(UBI_IOC_MAGIC, 2, struct ubi_rsvol_req)
++/* Re-name volumes */
++#define UBI_IOCRNVOL _IOW(UBI_IOC_MAGIC, 3, struct ubi_rnvol_req)
++
++/* ioctl commands of the UBI control character device */
++
++#define UBI_CTRL_IOC_MAGIC 'o'
++
++/* Attach an MTD device */
++#define UBI_IOCATT _IOW(UBI_CTRL_IOC_MAGIC, 64, struct ubi_attach_req)
++/* Detach an MTD device */
++#define UBI_IOCDET _IOW(UBI_CTRL_IOC_MAGIC, 65, int32_t)
++
++/* ioctl commands of UBI volume character devices */
++
++#define UBI_VOL_IOC_MAGIC 'O'
++
++/* Start UBI volume update */
++#define UBI_IOCVOLUP _IOW(UBI_VOL_IOC_MAGIC, 0, int64_t)
++/* LEB erasure command, used for debugging, disabled by default */
++#define UBI_IOCEBER _IOW(UBI_VOL_IOC_MAGIC, 1, int32_t)
++/* Atomic LEB change command */
++#define UBI_IOCEBCH _IOW(UBI_VOL_IOC_MAGIC, 2, int32_t)
++/* Map LEB command */
++#define UBI_IOCEBMAP _IOW(UBI_VOL_IOC_MAGIC, 3, struct ubi_map_req)
++/* Unmap LEB command */
++#define UBI_IOCEBUNMAP _IOW(UBI_VOL_IOC_MAGIC, 4, int32_t)
++/* Check if LEB is mapped command */
++#define UBI_IOCEBISMAP _IOR(UBI_VOL_IOC_MAGIC, 5, int32_t)
++/* Set an UBI volume property */
++#define UBI_IOCSETPROP _IOW(UBI_VOL_IOC_MAGIC, 6, struct ubi_set_prop_req)
++
++/* Maximum MTD device name length supported by UBI */
++#define MAX_UBI_MTD_NAME_LEN 127
++
++/* Maximum amount of UBI volumes that can be re-named at one go */
++#define UBI_MAX_RNVOL 32
++
++/*
++ * UBI data type hint constants.
++ *
++ * UBI_LONGTERM: long-term data
++ * UBI_SHORTTERM: short-term data
++ * UBI_UNKNOWN: data persistence is unknown
++ *
++ * These constants are used when data is written to UBI volumes in order to
++ * help the UBI wear-leveling unit to find more appropriate physical
++ * eraseblocks.
++ */
++enum {
++	UBI_LONGTERM  = 1,
++	UBI_SHORTTERM = 2,
++	UBI_UNKNOWN   = 3,
++};
++
++/*
++ * UBI volume type constants.
++ *
++ * @UBI_DYNAMIC_VOLUME: dynamic volume
++ * @UBI_STATIC_VOLUME:  static volume
++ */
++enum {
++	UBI_DYNAMIC_VOLUME = 3,
++	UBI_STATIC_VOLUME  = 4,
++};
++
++/*
++ * UBI set property ioctl constants
++ *
++ * @UBI_PROP_DIRECT_WRITE: allow / disallow user to directly write and
++ *                         erase individual eraseblocks on dynamic volumes
++ */
++enum {
++       UBI_PROP_DIRECT_WRITE = 1,
++};
++
++/**
++ * struct ubi_attach_req - attach MTD device request.
++ * @ubi_num: UBI device number to create
++ * @mtd_num: MTD device number to attach
++ * @vid_hdr_offset: VID header offset (use defaults if %0)
++ * @padding: reserved for future, not used, has to be zeroed
++ *
++ * This data structure is used to specify MTD device UBI has to attach and the
++ * parameters it has to use. The number which should be assigned to the new UBI
++ * device is passed in @ubi_num. UBI may automatically assign the number if
++ * @UBI_DEV_NUM_AUTO is passed. In this case, the device number is returned in
++ * @ubi_num.
++ *
++ * Most applications should pass %0 in @vid_hdr_offset to make UBI use default
++ * offset of the VID header within physical eraseblocks. The default offset is
++ * the next min. I/O unit after the EC header. For example, it will be offset
++ * 512 in case of a 512 bytes page NAND flash with no sub-page support. Or
++ * it will be 512 in case of a 2KiB page NAND flash with 4 512-byte sub-pages.
++ *
++ * But in rare cases, if this optimizes things, the VID header may be placed to
++ * a different offset. For example, the boot-loader might do things faster if
++ * the VID header sits at the end of the first 2KiB NAND page with 4 sub-pages.
++ * As the boot-loader would not normally need to read EC headers (unless it
++ * needs UBI in RW mode), it might be faster to calculate ECC. This is weird
++ * example, but it real-life example. So, in this example, @vid_hdr_offer would
++ * be 2KiB-64 bytes = 1984. Note, that this position is not even 512-bytes
++ * aligned, which is OK, as UBI is clever enough to realize this is 4th
++ * sub-page of the first page and add needed padding.
++ */
++struct ubi_attach_req {
++	int32_t ubi_num;
++	int32_t mtd_num;
++	int32_t vid_hdr_offset;
++	int8_t padding[12];
++};
++
++/**
++ * struct ubi_mkvol_req - volume description data structure used in
++ *                        volume creation requests.
++ * @vol_id: volume number
++ * @alignment: volume alignment
++ * @bytes: volume size in bytes
++ * @vol_type: volume type (%UBI_DYNAMIC_VOLUME or %UBI_STATIC_VOLUME)
++ * @padding1: reserved for future, not used, has to be zeroed
++ * @name_len: volume name length
++ * @padding2: reserved for future, not used, has to be zeroed
++ * @name: volume name
++ *
++ * This structure is used by user-space programs when creating new volumes. The
++ * @used_bytes field is only necessary when creating static volumes.
++ *
++ * The @alignment field specifies the required alignment of the volume logical
++ * eraseblock. This means, that the size of logical eraseblocks will be aligned
++ * to this number, i.e.,
++ *	(UBI device logical eraseblock size) mod (@alignment) = 0.
++ *
++ * To put it differently, the logical eraseblock of this volume may be slightly
++ * shortened in order to make it properly aligned. The alignment has to be
++ * multiple of the flash minimal input/output unit, or %1 to utilize the entire
++ * available space of logical eraseblocks.
++ *
++ * The @alignment field may be useful, for example, when one wants to maintain
++ * a block device on top of an UBI volume. In this case, it is desirable to fit
++ * an integer number of blocks in logical eraseblocks of this UBI volume. With
++ * alignment it is possible to update this volume using plane UBI volume image
++ * BLOBs, without caring about how to properly align them.
++ */
++struct ubi_mkvol_req {
++	int32_t vol_id;
++	int32_t alignment;
++	int64_t bytes;
++	int8_t vol_type;
++	int8_t padding1;
++	int16_t name_len;
++	int8_t padding2[4];
++	char name[UBI_MAX_VOLUME_NAME + 1];
++} __attribute__ ((packed));
++
++/**
++ * struct ubi_rsvol_req - a data structure used in volume re-size requests.
++ * @vol_id: ID of the volume to re-size
++ * @bytes: new size of the volume in bytes
++ *
++ * Re-sizing is possible for both dynamic and static volumes. But while dynamic
++ * volumes may be re-sized arbitrarily, static volumes cannot be made to be
++ * smaller than the number of bytes they bear. To arbitrarily shrink a static
++ * volume, it must be wiped out first (by means of volume update operation with
++ * zero number of bytes).
++ */
++struct ubi_rsvol_req {
++	int64_t bytes;
++	int32_t vol_id;
++} __attribute__ ((packed));
++
++/**
++ * struct ubi_rnvol_req - volumes re-name request.
++ * @count: count of volumes to re-name
++ * @padding1:  reserved for future, not used, has to be zeroed
++ * @vol_id: ID of the volume to re-name
++ * @name_len: name length
++ * @padding2:  reserved for future, not used, has to be zeroed
++ * @name: new volume name
++ *
++ * UBI allows to re-name up to %32 volumes at one go. The count of volumes to
++ * re-name is specified in the @count field. The ID of the volumes to re-name
++ * and the new names are specified in the @vol_id and @name fields.
++ *
++ * The UBI volume re-name operation is atomic, which means that should power cut
++ * happen, the volumes will have either old name or new name. So the possible
++ * use-cases of this command is atomic upgrade. Indeed, to upgrade, say, volumes
++ * A and B one may create temporary volumes %A1 and %B1 with the new contents,
++ * then atomically re-name A1->A and B1->B, in which case old %A and %B will
++ * be removed.
++ *
++ * If it is not desirable to remove old A and B, the re-name request has to
++ * contain 4 entries: A1->A, A->A1, B1->B, B->B1, in which case old A1 and B1
++ * become A and B, and old A and B will become A1 and B1.
++ *
++ * It is also OK to request: A1->A, A1->X, B1->B, B->Y, in which case old A1
++ * and B1 become A and B, and old A and B become X and Y.
++ *
++ * In other words, in case of re-naming into an existing volume name, the
++ * existing volume is removed, unless it is re-named as well at the same
++ * re-name request.
++ */
++struct ubi_rnvol_req {
++	int32_t count;
++	int8_t padding1[12];
++	struct {
++		int32_t vol_id;
++		int16_t name_len;
++		int8_t  padding2[2];
++		char    name[UBI_MAX_VOLUME_NAME + 1];
++	} ents[UBI_MAX_RNVOL];
++} __attribute__ ((packed));
++
++/**
++ * struct ubi_leb_change_req - a data structure used in atomic LEB change
++ *                             requests.
++ * @lnum: logical eraseblock number to change
++ * @bytes: how many bytes will be written to the logical eraseblock
++ * @dtype: data type (%UBI_LONGTERM, %UBI_SHORTTERM, %UBI_UNKNOWN)
++ * @padding: reserved for future, not used, has to be zeroed
++ */
++struct ubi_leb_change_req {
++	int32_t lnum;
++	int32_t bytes;
++	int8_t  dtype;
++	int8_t  padding[7];
++} __attribute__ ((packed));
++
++/**
++ * struct ubi_map_req - a data structure used in map LEB requests.
++ * @lnum: logical eraseblock number to unmap
++ * @dtype: data type (%UBI_LONGTERM, %UBI_SHORTTERM, %UBI_UNKNOWN)
++ * @padding: reserved for future, not used, has to be zeroed
++ */
++struct ubi_map_req {
++	int32_t lnum;
++	int8_t  dtype;
++	int8_t  padding[3];
++} __attribute__ ((packed));
++
++
++/**
++ * struct ubi_set_prop_req - a data structure used to set an ubi volume
++ *                           property.
++ * @property: property to set (%UBI_PROP_DIRECT_WRITE)
++ * @padding: reserved for future, not used, has to be zeroed
++ * @value: value to set
++ */
++struct ubi_set_prop_req {
++       uint8_t  property;
++       uint8_t  padding[7];
++       uint64_t value;
++}  __attribute__ ((packed));
++
++#endif /* __UBI_USER_H__ */
+diff --git a/ubi/include/xalloc.h b/ubi/include/xalloc.h
+new file mode 100644
+index 0000000..f1cc8d4
+--- /dev/null
++++ b/ubi/include/xalloc.h
+@@ -0,0 +1,106 @@
++/*
++ * memory wrappers
++ *
++ * Copyright (c) Artem Bityutskiy, 2007, 2008
++ * Copyright 2001, 2002 Red Hat, Inc.
++ *           2001 David A. Schleef <ds@lineo.com>
++ *           2002 Axis Communications AB
++ *           2001, 2002 Erik Andersen <andersen@codepoet.org>
++ *           2004 University of Szeged, Hungary
++ *           2006 KaiGai Kohei <kaigai@ak.jp.nec.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
++ * the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++#ifndef __MTD_UTILS_XALLOC_H__
++#define __MTD_UTILS_XALLOC_H__
++
++#include <stdlib.h>
++#include <string.h>
++
++/*
++ * Mark these functions as unused so that gcc does not emit warnings
++ * when people include this header but don't use every function.
++ */
++
++__attribute__((unused))
++static void *xmalloc(size_t size)
++{
++	void *ptr = malloc(size);
++
++	if (ptr == NULL && size != 0)
++		sys_errmsg_die("out of memory");
++	return ptr;
++}
++
++__attribute__((unused))
++static void *xcalloc(size_t nmemb, size_t size)
++{
++	void *ptr = calloc(nmemb, size);
++
++	if (ptr == NULL && nmemb != 0 && size != 0)
++		sys_errmsg_die("out of memory");
++	return ptr;
++}
++
++__attribute__((unused))
++static void *xzalloc(size_t size)
++{
++	return xcalloc(1, size);
++}
++
++__attribute__((unused))
++static void *xrealloc(void *ptr, size_t size)
++{
++	ptr = realloc(ptr, size);
++	if (ptr == NULL && size != 0)
++		sys_errmsg_die("out of memory");
++	return ptr;
++}
++
++__attribute__((unused))
++static char *xstrdup(const char *s)
++{
++	char *t;
++
++	if (s == NULL)
++		return NULL;
++	t = strdup(s);
++	if (t == NULL)
++		sys_errmsg_die("out of memory");
++	return t;
++}
++
++#ifdef _GNU_SOURCE
++#include <stdarg.h>
++
++__attribute__((unused))
++static int xasprintf(char **strp, const char *fmt, ...)
++{
++	int cnt;
++	va_list ap;
++
++	va_start(ap, fmt);
++	cnt = vasprintf(strp, fmt, ap);
++	va_end(ap);
++
++	if (cnt == -1)
++		sys_errmsg_die("out of memory");
++
++	return cnt;
++}
++#endif
++
++#endif /* !__MTD_UTILS_XALLOC_H__ */
+diff --git a/ubi/libubi.c b/ubi/libubi.c
+new file mode 100644
+index 0000000..88560e2
+--- /dev/null
++++ b/ubi/libubi.c
+@@ -0,0 +1,1378 @@
++/*
++ * Copyright (c) International Business Machines Corp., 2006
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
++ * the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ *
++ * Author: Artem Bityutskiy
++ *
++ * UBI (Unsorted Block Images) library.
++ */
++
++#define PROGRAM_NAME "libubi"
++
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include <fcntl.h>
++#include <dirent.h>
++#include <unistd.h>
++#include <limits.h>
++#include <sys/ioctl.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <libubi.h>
++#include "libubi_int.h"
++#include "common.h"
++#include "android_utils.h"
++
++#ifndef __MTD_UTILS_COMMON_H__
++#error asl;dfafsd
++#endif
++
++/**
++ * mkpath - compose full path from 2 given components.
++ * @path: the first component
++ * @name: the second component
++ *
++ * This function returns the resulting path in case of success and %NULL in
++ * case of failure.
++ */
++static char *mkpath(const char *path, const char *name)
++{
++	char *n;
++	int len1 = strlen(path);
++	int len2 = strlen(name);
++
++	n = malloc(len1 + len2 + 2);
++	if (!n) {
++		sys_errmsg("cannot allocate %d bytes", len1 + len2 + 2);
++		return NULL;
++	}
++
++	memcpy(n, path, len1);
++	if (n[len1 - 1] != '/')
++		n[len1++] = '/';
++
++	memcpy(n + len1, name, len2 + 1);
++	return n;
++}
++
++/**
++ * read_positive_ll - read a positive 'long long' value from a file.
++ * @file: the file to read from
++ * @value: the result is stored here
++ *
++ * This function reads file @file and interprets its contents as a positive
++ * 'long long' integer. If this is not true, it fails with %EINVAL error code.
++ * Returns %0 in case of success and %-1 in case of failure.
++ */
++static int read_positive_ll(const char *file, long long *value)
++{
++	int fd, rd;
++	char buf[50];
++
++	fd = open(file, O_RDONLY);
++	if (fd == -1)
++		return -1;
++
++	rd = read(fd, buf, sizeof(buf));
++	if (rd == -1) {
++		sys_errmsg("cannot read \"%s\"", file);
++		goto out_error;
++	}
++	if (rd == sizeof(buf)) {
++		errmsg("contents of \"%s\" is too long", file);
++		errno = EINVAL;
++		goto out_error;
++	}
++	buf[rd] = '\0';
++
++	if (sscanf(buf, "%lld\n", value) != 1) {
++		errmsg("cannot read integer from \"%s\"\n", file);
++		errno = EINVAL;
++		goto out_error;
++	}
++
++	if (*value < 0) {
++		errmsg("negative value %lld in \"%s\"", *value, file);
++		errno = EINVAL;
++		goto out_error;
++	}
++
++	if (close(fd))
++		return sys_errmsg("close failed on \"%s\"", file);
++
++	return 0;
++
++out_error:
++	close(fd);
++	return -1;
++}
++
++/**
++ * read_positive_int - read a positive 'int' value from a file.
++ * @file: the file to read from
++ * @value: the result is stored here
++ *
++ * This function is the same as 'read_positive_ll()', but it reads an 'int'
++ * value, not 'long long'.
++ */
++static int read_positive_int(const char *file, int *value)
++{
++	long long res;
++
++	if (read_positive_ll(file, &res))
++		return -1;
++
++	/* Make sure the value is not too big */
++	if (res > INT_MAX) {
++		errmsg("value %lld read from file \"%s\" is out of range",
++		       res, file);
++		errno = EINVAL;
++		return -1;
++	}
++
++	*value = res;
++	return 0;
++}
++
++/**
++ * read_data - read data from a file.
++ * @file: the file to read from
++ * @buf: the buffer to read to
++ * @buf_len: buffer length
++ *
++ * This function returns number of read bytes in case of success and %-1 in
++ * case of failure. Note, if the file contains more then @buf_len bytes of
++ * date, this function fails with %EINVAL error code.
++ */
++static int read_data(const char *file, void *buf, int buf_len)
++{
++	int fd, rd, tmp, tmp1;
++
++	fd = open(file, O_RDONLY);
++	if (fd == -1)
++		return -1;
++
++	rd = read(fd, buf, buf_len);
++	if (rd == -1) {
++		sys_errmsg("cannot read \"%s\"", file);
++		goto out_error;
++	}
++
++	if (rd == buf_len) {
++		errmsg("contents of \"%s\" is too long", file);
++		errno = EINVAL;
++		goto out_error;
++	}
++
++	((char *)buf)[rd] = '\0';
++
++	/* Make sure all data is read */
++	tmp1 = read(fd, &tmp, 1);
++	if (tmp1 == 1) {
++		sys_errmsg("cannot read \"%s\"", file);
++		goto out_error;
++	}
++	if (tmp1) {
++		errmsg("file \"%s\" contains too much data (> %d bytes)",
++		       file, buf_len);
++		errno = EINVAL;
++		goto out_error;
++	}
++
++	if (close(fd)) {
++		sys_errmsg("close failed on \"%s\"", file);
++		return -1;
++	}
++
++	return rd;
++
++out_error:
++	close(fd);
++	return -1;
++}
++
++/**
++ * read_major - read major and minor numbers from a file.
++ * @file: name of the file to read from
++ * @major: major number is returned here
++ * @minor: minor number is returned here
++ *
++ * This function returns % in case of succes, and %-1 in case of failure.
++ */
++static int read_major(const char *file, int *major, int *minor)
++{
++	int ret;
++	char buf[50];
++
++	ret = read_data(file, buf, 50);
++	if (ret < 0)
++		return ret;
++
++	ret = sscanf(buf, "%d:%d\n", major, minor);
++	if (ret != 2) {
++		errno = EINVAL;
++		return errmsg("\"%s\" does not have major:minor format", file);
++	}
++
++	if (*major < 0 || *minor < 0) {
++		errno = EINVAL;
++		return errmsg("bad major:minor %d:%d in \"%s\"",
++			      *major, *minor, file);
++	}
++
++	return 0;
++}
++
++/**
++ * dev_read_int - read a positive 'int' value from an UBI device sysfs file.
++ * @patt: file pattern to read from
++ * @dev_num: UBI device number
++ * @value: the result is stored here
++ *
++ * This function returns %0 in case of success and %-1 in case of failure.
++ */
++static int dev_read_int(const char *patt, int dev_num, int *value)
++{
++	char file[strlen(patt) + 50];
++
++	sprintf(file, patt, dev_num);
++	return read_positive_int(file, value);
++}
++
++/**
++ * vol_read_int - read a positive 'int' value from an UBI volume sysfs file.
++ * @patt: file pattern to read from
++ * @dev_num: UBI device number
++ * @vol_id: volume ID
++ * @value: the result is stored here
++ *
++ * This function returns %0 in case of success and %-1 in case of failure.
++ */
++static int vol_read_int(const char *patt, int dev_num, int vol_id, int *value)
++{
++	char file[strlen(patt) + 100];
++
++	sprintf(file, patt, dev_num, vol_id);
++	return read_positive_int(file, value);
++}
++
++/**
++ * dev_read_ll - read a positive 'long long' value from an UBI device sysfs file.
++ * @patt: file pattern to read from
++ * @dev_num: UBI device number
++ * @value: the result is stored here
++ *
++ * This function returns %0 in case of success and %-1 in case of failure.
++ */
++static int dev_read_ll(const char *patt, int dev_num, long long *value)
++{
++	char file[strlen(patt) + 50];
++
++	sprintf(file, patt, dev_num);
++	return read_positive_ll(file, value);
++}
++
++/**
++ * vol_read_ll - read a positive 'long long' value from an UBI volume sysfs file.
++ * @patt: file pattern to read from
++ * @dev_num: UBI device number
++ * @vol_id: volume ID
++ * @value: the result is stored here
++ *
++ * This function returns %0 in case of success and %-1 in case of failure.
++ */
++static int vol_read_ll(const char *patt, int dev_num, int vol_id,
++		       long long *value)
++{
++	char file[strlen(patt) + 100];
++
++	sprintf(file, patt, dev_num, vol_id);
++	return read_positive_ll(file, value);
++}
++
++/**
++ * vol_read_data - read data from an UBI volume's sysfs file.
++ * @patt: file pattern to read from
++ * @dev_num: UBI device number
++ * @vol_id: volume ID
++ * @buf: buffer to read to
++ * @buf_len: buffer length
++ *
++ * This function returns number of read bytes in case of success and %-1 in
++ * case of failure.
++ */
++static int vol_read_data(const char *patt, int dev_num, int vol_id, void *buf,
++			 int buf_len)
++{
++	char file[strlen(patt) + 100];
++
++	sprintf(file, patt, dev_num, vol_id);
++	return read_data(file, buf, buf_len);
++}
++
++/**
++ * dev_get_major - get major and minor numbers of an UBI device.
++ * @lib: libubi descriptor
++ * @dev_num: UBI device number
++ * @major: major number is returned here
++ * @minor: minor number is returned here
++ *
++ * This function returns zero in case of succes and %-1 in case of failure.
++ */
++static int dev_get_major(struct libubi *lib, int dev_num, int *major, int *minor)
++{
++	char file[strlen(lib->dev_dev) + 50];
++
++	sprintf(file, lib->dev_dev, dev_num);
++	return read_major(file, major, minor);
++}
++
++/**
++ * vol_get_major - get major and minor numbers of an UBI volume.
++ * @lib: libubi descriptor
++ * @dev_num: UBI device number
++ * @vol_id: volume ID
++ * @major: major number is returned here
++ * @minor: minor number is returned here
++ *
++ * This function returns zero in case of succes and %-1 in case of failure.
++ */
++static int vol_get_major(struct libubi *lib, int dev_num, int vol_id,
++			 int *major, int *minor)
++{
++	char file[strlen(lib->vol_dev) + 100];
++
++	sprintf(file, lib->vol_dev, dev_num, vol_id);
++	return read_major(file, major, minor);
++}
++
++/**
++ * vol_node2nums - find UBI device number and volume ID by volume device node
++ *                 file.
++ * @lib: UBI library descriptor
++ * @node: UBI character device node name
++ * @dev_num: UBI device number is returned here
++ * @vol_id: volume ID is returned hers
++ *
++ * This function returns zero in case of succes and %-1 in case of failure.
++ */
++static int vol_node2nums(struct libubi *lib, const char *node, int *dev_num,
++			 int *vol_id)
++{
++	struct stat st;
++	struct ubi_info info;
++	int i, fd, major, minor;
++	char file[strlen(lib->ubi_vol) + 100];
++
++	if (stat(node, &st))
++		return sys_errmsg("cannot get information about \"%s\"",
++				  node);
++
++	if (!S_ISCHR(st.st_mode)) {
++		errno = EINVAL;
++		return errmsg("\"%s\" is not a character device", node);
++	}
++
++	major = MAJOR(st.st_rdev);
++	minor = MINOR(st.st_rdev);
++
++	if (minor == 0) {
++		errno = EINVAL;
++		return errmsg("\"%s\" is not a volume character device", node);
++	}
++
++	if (ubi_get_info((libubi_t *)lib, &info))
++		return -1;
++
++	for (i = info.lowest_dev_num; i <= info.highest_dev_num; i++) {
++		int major1, minor1, ret;
++
++		ret = dev_get_major(lib, i, &major1, &minor1);
++		if (ret) {
++			if (errno == ENOENT)
++				continue;
++			return -1;
++		}
++
++		if (major1 == major)
++			break;
++	}
++
++	if (i > info.highest_dev_num) {
++		errno = ENODEV;
++		return -1;
++	}
++
++	/* Make sure this UBI volume exists */
++	sprintf(file, lib->ubi_vol, i, minor - 1);
++	fd = open(file, O_RDONLY);
++	if (fd == -1) {
++		errno = ENODEV;
++		return -1;
++	}
++
++	*dev_num = i;
++	*vol_id = minor - 1;
++	errno = 0;
++	return 0;
++}
++
++/**
++ * dev_node2num - find UBI device number by its character device node.
++ * @lib: UBI library descriptor
++ * @node: UBI character device node name
++ * @dev_num: UBI device number is returned here
++ *
++ * This function returns %0 in case of success and %-1 in case of failure.
++ */
++static int dev_node2num(struct libubi *lib, const char *node, int *dev_num)
++{
++	struct stat st;
++	struct ubi_info info;
++	int i, major, minor;
++
++	if (stat(node, &st))
++		return sys_errmsg("cannot get information about \"%s\"", node);
++
++	if (!S_ISCHR(st.st_mode)) {
++		errno = EINVAL;
++		return errmsg("\"%s\" is not a character device", node);
++	}
++
++	major = MAJOR(st.st_rdev);
++	minor = MINOR(st.st_rdev);
++
++	if (minor != 0) {
++		errno = EINVAL;
++		return errmsg("\"%s\" is not an UBI character device", node);
++	}
++
++	if (ubi_get_info((libubi_t *)lib, &info))
++		return -1;
++
++	for (i = info.lowest_dev_num; i <= info.highest_dev_num; i++) {
++		int major1, minor1, ret;
++
++		ret = dev_get_major(lib, i, &major1, &minor1);
++		if (ret) {
++			if (errno == ENOENT)
++				continue;
++			return -1;
++		}
++
++		if (major1 == major) {
++			if (minor1 != 0) {
++				errmsg("UBI character device minor number is "
++				       "%d, but must be 0", minor1);
++				errno = EINVAL;
++				return -1;
++			}
++			errno = 0;
++			*dev_num = i;
++			return 0;
++		}
++	}
++
++	errno = ENODEV;
++	return -1;
++}
++
++int mtd_num2ubi_dev(libubi_t desc, int mtd_num, int *dev_num)
++{
++	struct ubi_info info;
++	int i, ret, mtd_num1;
++	struct libubi *lib = desc;
++
++	if (ubi_get_info(desc, &info))
++		return -1;
++
++	for (i = info.lowest_dev_num; i <= info.highest_dev_num; i++) {
++		ret = dev_read_int(lib->dev_mtd_num, i, &mtd_num1);
++		if (ret) {
++			if (errno == ENOENT)
++				continue;
++			return -1;
++		}
++
++		if (mtd_num1 == mtd_num) {
++			errno = 0;
++			*dev_num = i;
++			return 0;
++		}
++	}
++
++	errno = 0;
++	return -1;
++}
++
++libubi_t libubi_open(void)
++{
++	int fd, version;
++	struct libubi *lib;
++
++	lib = calloc(1, sizeof(struct libubi));
++	if (!lib)
++		return NULL;
++
++	lib->sysfs_ctrl = mkpath("/sys", SYSFS_CTRL);
++	if (!lib->sysfs_ctrl)
++		goto out_error;
++
++	lib->ctrl_dev = mkpath(lib->sysfs_ctrl, CTRL_DEV);
++	if (!lib->ctrl_dev)
++		goto out_error;
++
++	lib->sysfs_ubi = mkpath("/sys", SYSFS_UBI);
++	if (!lib->sysfs_ubi)
++		goto out_error;
++
++	/* Make sure UBI is present */
++	fd = open(lib->sysfs_ubi, O_RDONLY);
++	if (fd == -1) {
++		errno = 0;
++		goto out_error;
++	}
++
++	if (close(fd)) {
++		sys_errmsg("close failed on \"%s\"", lib->sysfs_ubi);
++		goto out_error;
++	}
++
++	lib->ubi_dev = mkpath(lib->sysfs_ubi, UBI_DEV_NAME_PATT);
++	if (!lib->ubi_dev)
++		goto out_error;
++
++	lib->ubi_version = mkpath(lib->sysfs_ubi, UBI_VER);
++	if (!lib->ubi_version)
++		goto out_error;
++
++	lib->dev_dev = mkpath(lib->ubi_dev, DEV_DEV);
++	if (!lib->dev_dev)
++		goto out_error;
++
++	lib->dev_avail_ebs = mkpath(lib->ubi_dev, DEV_AVAIL_EBS);
++	if (!lib->dev_avail_ebs)
++		goto out_error;
++
++	lib->dev_total_ebs = mkpath(lib->ubi_dev, DEV_TOTAL_EBS);
++	if (!lib->dev_total_ebs)
++		goto out_error;
++
++	lib->dev_bad_count = mkpath(lib->ubi_dev, DEV_BAD_COUNT);
++	if (!lib->dev_bad_count)
++		goto out_error;
++
++	lib->dev_eb_size = mkpath(lib->ubi_dev, DEV_EB_SIZE);
++	if (!lib->dev_eb_size)
++		goto out_error;
++
++	lib->dev_max_ec = mkpath(lib->ubi_dev, DEV_MAX_EC);
++	if (!lib->dev_max_ec)
++		goto out_error;
++
++	lib->dev_bad_rsvd = mkpath(lib->ubi_dev, DEV_MAX_RSVD);
++	if (!lib->dev_bad_rsvd)
++		goto out_error;
++
++	lib->dev_max_vols = mkpath(lib->ubi_dev, DEV_MAX_VOLS);
++	if (!lib->dev_max_vols)
++		goto out_error;
++
++	lib->dev_min_io_size = mkpath(lib->ubi_dev, DEV_MIN_IO_SIZE);
++	if (!lib->dev_min_io_size)
++		goto out_error;
++
++	lib->dev_mtd_num = mkpath(lib->ubi_dev, DEV_MTD_NUM);
++	if (!lib->dev_mtd_num)
++		goto out_error;
++
++	lib->ubi_vol = mkpath(lib->sysfs_ubi, UBI_VOL_NAME_PATT);
++	if (!lib->ubi_vol)
++		goto out_error;
++
++	lib->vol_type = mkpath(lib->ubi_vol, VOL_TYPE);
++	if (!lib->vol_type)
++		goto out_error;
++
++	lib->vol_dev = mkpath(lib->ubi_vol, VOL_DEV);
++	if (!lib->vol_dev)
++		goto out_error;
++
++	lib->vol_alignment = mkpath(lib->ubi_vol, VOL_ALIGNMENT);
++	if (!lib->vol_alignment)
++		goto out_error;
++
++	lib->vol_data_bytes = mkpath(lib->ubi_vol, VOL_DATA_BYTES);
++	if (!lib->vol_data_bytes)
++		goto out_error;
++
++	lib->vol_rsvd_ebs = mkpath(lib->ubi_vol, VOL_RSVD_EBS);
++	if (!lib->vol_rsvd_ebs)
++		goto out_error;
++
++	lib->vol_eb_size = mkpath(lib->ubi_vol, VOL_EB_SIZE);
++	if (!lib->vol_eb_size)
++		goto out_error;
++
++	lib->vol_corrupted = mkpath(lib->ubi_vol, VOL_CORRUPTED);
++	if (!lib->vol_corrupted)
++		goto out_error;
++
++	lib->vol_name = mkpath(lib->ubi_vol, VOL_NAME);
++	if (!lib->vol_name)
++		goto out_error;
++
++	if (read_positive_int(lib->ubi_version, &version))
++		goto out_error;
++	if (version != LIBUBI_UBI_VERSION) {
++		errmsg("this library was made for UBI version %d, but UBI "
++		       "version %d is detected\n", LIBUBI_UBI_VERSION, version);
++		goto out_error;
++	}
++
++	return lib;
++
++out_error:
++	libubi_close((libubi_t)lib);
++	return NULL;
++}
++
++void libubi_close(libubi_t desc)
++{
++	struct libubi *lib = (struct libubi *)desc;
++
++	free(lib->vol_name);
++	free(lib->vol_corrupted);
++	free(lib->vol_eb_size);
++	free(lib->vol_rsvd_ebs);
++	free(lib->vol_data_bytes);
++	free(lib->vol_alignment);
++	free(lib->vol_dev);
++	free(lib->vol_type);
++	free(lib->ubi_vol);
++	free(lib->dev_mtd_num);
++	free(lib->dev_min_io_size);
++	free(lib->dev_max_vols);
++	free(lib->dev_bad_rsvd);
++	free(lib->dev_max_ec);
++	free(lib->dev_eb_size);
++	free(lib->dev_bad_count);
++	free(lib->dev_total_ebs);
++	free(lib->dev_avail_ebs);
++	free(lib->dev_dev);
++	free(lib->ubi_version);
++	free(lib->ubi_dev);
++	free(lib->sysfs_ubi);
++	free(lib->ctrl_dev);
++	free(lib->sysfs_ctrl);
++	free(lib);
++}
++
++/**
++ * do_attach - perform the actual attach operation.
++ * @node: name of the UBI control character device node
++ * @r: attach request
++ *
++ * This function performs the actual UBI attach operation. Returns %0 in case of
++ * success and %-1 in case of failure. @r->ubi_num contains newly created UBI
++ * device number.
++ */
++static int do_attach(const char *node, const struct ubi_attach_req *r)
++{
++	int fd, ret;
++
++	fd = open(node, O_RDONLY);
++	if (fd == -1)
++		return sys_errmsg("cannot open \"%s\"", node);
++
++	ret = ioctl(fd, UBI_IOCATT, r);
++	close(fd);
++	if (ret == -1)
++		return -1;
++
++#ifdef UDEV_SETTLE_HACK
++//	if (system("udevsettle") == -1)
++//		return -1;
++	usleep(100000);
++#endif
++	return ret;
++}
++
++int ubi_attach_mtd(libubi_t desc, const char *node,
++		   struct ubi_attach_request *req)
++{
++	struct ubi_attach_req r;
++	int ret;
++
++	(void)desc;
++
++	memset(&r, 0, sizeof(struct ubi_attach_req));
++	r.ubi_num = req->dev_num;
++	r.mtd_num = req->mtd_num;
++	r.vid_hdr_offset = req->vid_hdr_offset;
++
++	ret = do_attach(node, &r);
++	if (ret == 0)
++		req->dev_num = r.ubi_num;
++
++	return ret;
++}
++
++#ifndef MTD_CHAR_MAJOR
++/*
++ * This is taken from kernel <linux/mtd/mtd.h> and is unlikely to change anytime
++ * soon.
++ */
++#define MTD_CHAR_MAJOR 90
++#endif
++
++/**
++ * mtd_node_to_num - converts device node to MTD number.
++ * @mtd_dev_node: path to device node to convert
++ *
++ * This function converts given @mtd_dev_node to MTD device number.
++ * @mtd_dev_node should contain path to the MTD device node. Returns MTD device
++ * number in case of success and %-1 in case of failure (errno is set).
++ */
++static int mtd_node_to_num(const char *mtd_dev_node)
++{
++	int major, minor;
++	struct stat sb;
++
++	if (stat(mtd_dev_node, &sb) < 0)
++		return sys_errmsg("cannot stat \"%s\"", mtd_dev_node);
++
++	if (!S_ISCHR(sb.st_mode)) {
++		errno = EINVAL;
++		return sys_errmsg("\"%s\" is not a character device",
++				  mtd_dev_node);
++	}
++
++	major = MAJOR(sb.st_rdev);
++	minor = MINOR(sb.st_rdev);
++
++	if (major != MTD_CHAR_MAJOR) {
++		errno = EINVAL;
++		return sys_errmsg("\"%s\" is not an MTD device", mtd_dev_node);
++	}
++
++	return minor / 2;
++}
++
++int ubi_attach(libubi_t desc, const char *node, struct ubi_attach_request *req)
++{
++	struct ubi_attach_req r;
++	int ret;
++
++	if (!req->mtd_dev_node)
++		/* Fallback to opening by mtd_num */
++		return ubi_attach_mtd(desc, node, req);
++
++	memset(&r, 0, sizeof(struct ubi_attach_req));
++	r.ubi_num = req->dev_num;
++	r.vid_hdr_offset = req->vid_hdr_offset;
++
++	/*
++	 * User has passed path to device node. Lets find out MTD device number
++	 * of the device and pass it to the kernel.
++	 */
++	r.mtd_num = mtd_node_to_num(req->mtd_dev_node);
++	if (r.mtd_num == -1)
++		return -1;
++
++	ret = do_attach(node, &r);
++	if (ret == 0)
++		req->dev_num = r.ubi_num;
++
++	return ret;
++}
++
++int ubi_detach_mtd(libubi_t desc, const char *node, int mtd_num)
++{
++	int ret, ubi_dev;
++
++	ret = mtd_num2ubi_dev(desc, mtd_num, &ubi_dev);
++	if (ret == -1) {
++		errno = ENODEV;
++		return ret;
++	}
++
++	return ubi_remove_dev(desc, node, ubi_dev);
++}
++
++int ubi_detach(libubi_t desc, const char *node, const char *mtd_dev_node)
++{
++	int mtd_num;
++
++	if (!mtd_dev_node) {
++		errno = EINVAL;
++		return -1;
++	}
++
++	mtd_num = mtd_node_to_num(mtd_dev_node);
++	if (mtd_num == -1)
++		return -1;
++
++	return ubi_detach_mtd(desc, node, mtd_num);
++}
++
++int ubi_remove_dev(libubi_t desc, const char *node, int ubi_dev)
++{
++	int fd, ret;
++
++	desc = desc;
++
++	fd = open(node, O_RDONLY);
++	if (fd == -1)
++		return sys_errmsg("cannot open \"%s\"", node);
++	ret = ioctl(fd, UBI_IOCDET, &ubi_dev);
++	if (ret == -1)
++		goto out_close;
++
++#ifdef UDEV_SETTLE_HACK
++//	if (system("udevsettle") == -1)
++//		return -1;
++	usleep(100000);
++#endif
++
++out_close:
++	close(fd);
++	return ret;
++}
++
++int ubi_probe_node(libubi_t desc, const char *node)
++{
++	struct stat st;
++	struct ubi_info info;
++	int i, fd, major, minor;
++	struct libubi *lib = (struct libubi *)desc;
++	char file[strlen(lib->ubi_vol) + 100];
++
++	if (stat(node, &st))
++		return sys_errmsg("cannot get information about \"%s\"", node);
++
++	if (!S_ISCHR(st.st_mode)) {
++		errmsg("\"%s\" is not a character device", node);
++		errno = EINVAL;
++		return -1;
++	}
++
++	major = MAJOR(st.st_rdev);
++	minor = MINOR(st.st_rdev);
++
++	if (ubi_get_info((libubi_t *)lib, &info))
++		return -1;
++
++	for (i = info.lowest_dev_num; i <= info.highest_dev_num; i++) {
++		int major1, minor1, ret;
++
++		ret = dev_get_major(lib, i, &major1, &minor1);
++		if (ret) {
++			if (errno == ENOENT)
++				continue;
++			if (!errno)
++				goto out_not_ubi;
++			return -1;
++		}
++
++		if (major1 == major)
++			break;
++	}
++
++	if (i > info.highest_dev_num)
++		goto out_not_ubi;
++
++	if (minor == 0)
++		return 1;
++
++	/* This is supposdely an UBI volume device node */
++	sprintf(file, lib->ubi_vol, i, minor - 1);
++	fd = open(file, O_RDONLY);
++	if (fd == -1)
++		goto out_not_ubi;
++
++	return 2;
++
++out_not_ubi:
++	errmsg("\"%s\" has major:minor %d:%d, but this does not correspond to "
++	       "any existing UBI device or volume", node, major, minor);
++	errno = ENODEV;
++	return -1;
++}
++
++int ubi_get_info(libubi_t desc, struct ubi_info *info)
++{
++	DIR *sysfs_ubi;
++	struct dirent *dirent;
++	struct libubi *lib = (struct libubi *)desc;
++
++	memset(info, 0, sizeof(struct ubi_info));
++
++	if (read_major(lib->ctrl_dev, &info->ctrl_major, &info->ctrl_minor)) {
++		/*
++		 * Older UBI versions did not have control device, so we do not
++		 * panic here for compatibility reasons. May be few years later
++		 * we could return -1 here, but for now just set major:minor to
++		 * -1.
++		 */
++		info->ctrl_major = info->ctrl_minor = -1;
++	}
++
++	/*
++	 * We have to scan the UBI sysfs directory to identify how many UBI
++	 * devices are present.
++	 */
++	sysfs_ubi = opendir(lib->sysfs_ubi);
++	if (!sysfs_ubi)
++		return -1;
++
++	info->lowest_dev_num = INT_MAX;
++	while (1) {
++		int dev_num, ret;
++		char tmp_buf[256];
++
++		errno = 0;
++		dirent = readdir(sysfs_ubi);
++		if (!dirent)
++			break;
++
++		if (strlen(dirent->d_name) >= 255) {
++			errmsg("invalid entry in %s: \"%s\"",
++			       lib->sysfs_ubi, dirent->d_name);
++			errno = EINVAL;
++			goto out_close;
++		}
++
++		ret = sscanf(dirent->d_name, UBI_DEV_NAME_PATT"%s",
++			     &dev_num, tmp_buf);
++		if (ret == 1) {
++			info->dev_count += 1;
++			if (dev_num > info->highest_dev_num)
++				info->highest_dev_num = dev_num;
++			if (dev_num < info->lowest_dev_num)
++				info->lowest_dev_num = dev_num;
++		}
++	}
++
++	if (!dirent && errno) {
++		sys_errmsg("readdir failed on \"%s\"", lib->sysfs_ubi);
++		goto out_close;
++	}
++
++	if (closedir(sysfs_ubi))
++		return sys_errmsg("closedir failed on \"%s\"", lib->sysfs_ubi);
++
++	if (info->lowest_dev_num == INT_MAX)
++		info->lowest_dev_num = 0;
++
++	if (read_positive_int(lib->ubi_version, &info->version))
++		return -1;
++
++	return 0;
++
++out_close:
++	closedir(sysfs_ubi);
++	return -1;
++}
++
++int ubi_mkvol(libubi_t desc, const char *node, struct ubi_mkvol_request *req)
++{
++	int fd, ret;
++	struct ubi_mkvol_req r;
++	size_t n;
++
++	memset(&r, 0, sizeof(struct ubi_mkvol_req));
++
++	desc = desc;
++	r.vol_id = req->vol_id;
++	r.alignment = req->alignment;
++	r.bytes = req->bytes;
++	r.vol_type = req->vol_type;
++
++	n = strlen(req->name);
++	if (n > UBI_MAX_VOLUME_NAME)
++		return -2;
++
++	strncpy(r.name, req->name, UBI_MAX_VOLUME_NAME + 1);
++	r.name_len = n;
++
++	desc = desc;
++	fd = open(node, O_RDONLY);
++	if (fd == -1)
++		{ sys_errmsg("cannot open \"%s\"", node); return -3;}
++
++	ret = ioctl(fd, UBI_IOCMKVOL, &r);
++	if (ret == -1) {
++		close(fd);
++		//return ret;
++		return -errno;
++	}
++
++	close(fd);
++	req->vol_id = r.vol_id;
++
++#ifdef UDEV_SETTLE_HACK
++//	if (system("udevsettle") == -1)
++//		return -1;
++	usleep(100000);
++#endif
++
++	return 0;
++}
++
++int ubi_rmvol(libubi_t desc, const char *node, int vol_id)
++{
++	int fd, ret;
++
++	desc = desc;
++	fd = open(node, O_RDONLY);
++	if (fd == -1)
++		return sys_errmsg("cannot open \"%s\"", node);
++
++	ret = ioctl(fd, UBI_IOCRMVOL, &vol_id);
++	if (ret == -1) {
++		close(fd);
++		return ret;
++	}
++
++	close(fd);
++
++#ifdef UDEV_SETTLE_HACK
++//	if (system("udevsettle") == -1)
++//		return -1;
++	usleep(100000);
++#endif
++
++	return 0;
++}
++
++int ubi_rnvols(libubi_t desc, const char *node, struct ubi_rnvol_req *rnvol)
++{
++	int fd, ret;
++
++	desc = desc;
++	fd = open(node, O_RDONLY);
++	if (fd == -1)
++		return -1;
++
++	ret = ioctl(fd, UBI_IOCRNVOL, rnvol);
++	if (ret == -1) {
++		close(fd);
++		return ret;
++	}
++
++	close(fd);
++
++#ifdef UDEV_SETTLE_HACK
++//	if (system("udevsettle") == -1)
++//		return -1;
++	usleep(100000);
++#endif
++
++	return 0;
++}
++
++int ubi_rsvol(libubi_t desc, const char *node, int vol_id, long long bytes)
++{
++	int fd, ret;
++	struct ubi_rsvol_req req;
++
++	desc = desc;
++	fd = open(node, O_RDONLY);
++	if (fd == -1)
++		return sys_errmsg("cannot open \"%s\"", node);
++
++	req.bytes = bytes;
++	req.vol_id = vol_id;
++
++	ret = ioctl(fd, UBI_IOCRSVOL, &req);
++	close(fd);
++	return ret;
++}
++
++int ubi_update_start(libubi_t desc, int fd, long long bytes)
++{
++	desc = desc;
++	if (ioctl(fd, UBI_IOCVOLUP, &bytes))
++		return -1;
++	return 0;
++}
++
++int ubi_leb_change_start(libubi_t desc, int fd, int lnum, int bytes, int dtype)
++{
++	struct ubi_leb_change_req req;
++
++	desc = desc;
++	memset(&req, 0, sizeof(struct ubi_leb_change_req));
++	req.lnum = lnum;
++	req.bytes = bytes;
++	req.dtype = dtype;
++
++	if (ioctl(fd, UBI_IOCEBCH, &req))
++		return -1;
++	return 0;
++}
++
++/**
++ * dev_present - check whether an UBI device is present.
++ * @lib: libubi descriptor
++ * @dev_num: UBI device number to check
++ *
++ * This function returns %1 if UBI device is present and %0 if not.
++ */
++static int dev_present(struct libubi *lib, int dev_num)
++{
++	struct stat st;
++	char file[strlen(lib->ubi_dev) + 50];
++
++	sprintf(file, lib->ubi_dev, dev_num);
++	return !stat(file, &st);
++}
++
++int ubi_get_dev_info1(libubi_t desc, int dev_num, struct ubi_dev_info *info)
++{
++	DIR *sysfs_ubi;
++	struct dirent *dirent;
++	struct libubi *lib = (struct libubi *)desc;
++
++	memset(info, 0, sizeof(struct ubi_dev_info));
++	info->dev_num = dev_num;
++
++	if (!dev_present(lib, dev_num))
++		return -1;
++
++	sysfs_ubi = opendir(lib->sysfs_ubi);
++	if (!sysfs_ubi)
++		return -1;
++
++	info->lowest_vol_id = INT_MAX;
++
++	while (1) {
++		int vol_id, ret, devno;
++		char tmp_buf[256];
++
++		errno = 0;
++		dirent = readdir(sysfs_ubi);
++		if (!dirent)
++			break;
++
++		if (strlen(dirent->d_name) >= 255) {
++			errmsg("invalid entry in %s: \"%s\"",
++			       lib->sysfs_ubi, dirent->d_name);
++			goto out_close;
++		}
++
++		ret = sscanf(dirent->d_name, UBI_VOL_NAME_PATT"%s", &devno, &vol_id, tmp_buf);
++		if (ret == 2 && devno == dev_num) {
++			info->vol_count += 1;
++			if (vol_id > info->highest_vol_id)
++				info->highest_vol_id = vol_id;
++			if (vol_id < info->lowest_vol_id)
++				info->lowest_vol_id = vol_id;
++		}
++	}
++
++	if (!dirent && errno) {
++		sys_errmsg("readdir failed on \"%s\"", lib->sysfs_ubi);
++		goto out_close;
++	}
++
++	if (closedir(sysfs_ubi))
++		return sys_errmsg("closedir failed on \"%s\"", lib->sysfs_ubi);
++
++	if (info->lowest_vol_id == INT_MAX)
++		info->lowest_vol_id = 0;
++
++	if (dev_get_major(lib, dev_num, &info->major, &info->minor))
++		return -1;
++
++	if (dev_read_int(lib->dev_mtd_num, dev_num, &info->mtd_num))
++		return -1;
++	if (dev_read_int(lib->dev_avail_ebs, dev_num, &info->avail_lebs))
++		return -1;
++	if (dev_read_int(lib->dev_total_ebs, dev_num, &info->total_lebs))
++		return -1;
++	if (dev_read_int(lib->dev_bad_count, dev_num, &info->bad_count))
++		return -1;
++	if (dev_read_int(lib->dev_eb_size, dev_num, &info->leb_size))
++		return -1;
++	if (dev_read_int(lib->dev_bad_rsvd, dev_num, &info->bad_rsvd))
++		return -1;
++	if (dev_read_ll(lib->dev_max_ec, dev_num, &info->max_ec))
++		return -1;
++	if (dev_read_int(lib->dev_max_vols, dev_num, &info->max_vol_count))
++		return -1;
++	if (dev_read_int(lib->dev_min_io_size, dev_num, &info->min_io_size))
++		return -1;
++
++	info->avail_bytes = (long long)info->avail_lebs * info->leb_size;
++	info->total_bytes = (long long)info->total_lebs * info->leb_size;
++
++	return 0;
++
++out_close:
++	closedir(sysfs_ubi);
++	return -1;
++}
++
++int ubi_get_dev_info(libubi_t desc, const char *node, struct ubi_dev_info *info)
++{
++	int err, dev_num;
++	struct libubi *lib = (struct libubi *)desc;
++
++	err = ubi_probe_node(desc, node);
++	if (err != 1) {
++		if (err == 2)
++			errno = ENODEV;
++		return -1;
++	}
++
++	if (dev_node2num(lib, node, &dev_num))
++		return -1;
++
++	return ubi_get_dev_info1(desc, dev_num, info);
++}
++
++int ubi_get_vol_info1(libubi_t desc, int dev_num, int vol_id,
++		      struct ubi_vol_info *info)
++{
++	int ret;
++	struct libubi *lib = (struct libubi *)desc;
++	char buf[50];
++
++	memset(info, 0, sizeof(struct ubi_vol_info));
++	info->dev_num = dev_num;
++	info->vol_id = vol_id;
++
++	if (vol_get_major(lib, dev_num, vol_id, &info->major, &info->minor))
++		return -1;
++
++	ret = vol_read_data(lib->vol_type, dev_num, vol_id, buf, 50);
++	if (ret < 0)
++		return -1;
++
++	if (strncmp(buf, "static\n", ret) == 0)
++		info->type = UBI_STATIC_VOLUME;
++	else if (strncmp(buf, "dynamic\n", ret) == 0)
++		info->type = UBI_DYNAMIC_VOLUME;
++	else {
++		errmsg("bad value at \"%s\"", buf);
++		errno = EINVAL;
++		return -1;
++	}
++
++	ret = vol_read_int(lib->vol_alignment, dev_num, vol_id,
++			   &info->alignment);
++	if (ret)
++		return -1;
++	ret = vol_read_ll(lib->vol_data_bytes, dev_num, vol_id,
++			  &info->data_bytes);
++	if (ret)
++		return -1;
++	ret = vol_read_int(lib->vol_rsvd_ebs, dev_num, vol_id, &info->rsvd_lebs);
++	if (ret)
++		return -1;
++	ret = vol_read_int(lib->vol_eb_size, dev_num, vol_id, &info->leb_size);
++	if (ret)
++		return -1;
++	ret = vol_read_int(lib->vol_corrupted, dev_num, vol_id,
++			   &info->corrupted);
++	if (ret)
++		return -1;
++	info->rsvd_bytes = (long long)info->leb_size * info->rsvd_lebs;
++
++	ret = vol_read_data(lib->vol_name, dev_num, vol_id, &info->name,
++			    UBI_VOL_NAME_MAX + 2);
++	if (ret < 0)
++		return -1;
++
++	info->name[ret - 1] = '\0';
++	return 0;
++}
++
++int ubi_get_vol_info(libubi_t desc, const char *node, struct ubi_vol_info *info)
++{
++	int err, vol_id, dev_num;
++	struct libubi *lib = (struct libubi *)desc;
++
++	err = ubi_probe_node(desc, node);
++	if (err != 2) {
++		if (err == 1)
++			errno = ENODEV;
++		return -1;
++	}
++
++	if (vol_node2nums(lib, node, &dev_num, &vol_id))
++		return -1;
++
++	return ubi_get_vol_info1(desc, dev_num, vol_id, info);
++}
++
++int ubi_get_vol_info1_nm(libubi_t desc, int dev_num, const char *name,
++			 struct ubi_vol_info *info)
++{
++	int i, err;
++	unsigned int nlen = strlen(name);
++	struct ubi_dev_info dev_info;
++
++	if (nlen == 0) {
++		errmsg("bad \"name\" input parameter");
++		errno = EINVAL;
++		return -1;
++	}
++
++	err = ubi_get_dev_info1(desc, dev_num, &dev_info);
++	if (err)
++		return err;
++
++	for (i = dev_info.lowest_vol_id;
++	     i <= dev_info.highest_vol_id; i++) {
++		err = ubi_get_vol_info1(desc, dev_num, i, info);
++		if (err == -1) {
++			if (errno == ENOENT)
++				continue;
++			return -1;
++		}
++
++		if (nlen == strlen(info->name) && !strcmp(name, info->name))
++			return 0;
++	}
++
++	errno = ENOENT;
++	return -1;
++}
++
++int ubi_set_property(int fd, uint8_t property, uint64_t value)
++{
++	struct ubi_set_prop_req r;
++
++	memset(&r, 0, sizeof(struct ubi_set_prop_req));
++	r.property = property;
++	r.value = value;
++
++	return ioctl(fd, UBI_IOCSETPROP, &r);
++}
++
++int ubi_leb_unmap(int fd, int lnum)
++{
++	return ioctl(fd, UBI_IOCEBUNMAP, &lnum);
++}
++
++int ubi_is_mapped(int fd, int lnum)
++{
++	return ioctl(fd, UBI_IOCEBISMAP, &lnum);
++}
+diff --git a/ubi/ubiutils-common.c b/ubi/ubiutils-common.c
+new file mode 100644
+index 0000000..6609a6b
+--- /dev/null
++++ b/ubi/ubiutils-common.c
+@@ -0,0 +1,211 @@
++/*
++ * Copyright (C) 2007, 2008 Nokia Corporation
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
++ * the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++/*
++ * This file contains various common stuff used by UBI utilities.
++ *
++ * Authors: Artem Bityutskiy
++ *          Adrian Hunter
++ */
++
++#define PROGRAM_NAME "ubiutils"
++
++#include <sys/time.h>
++#include <sys/types.h>
++#include <stdio.h>
++#include <string.h>
++#include <ctype.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include "common.h"
++
++/**
++ * get_multiplier - convert size specifier to an integer multiplier.
++ * @str: the size specifier string
++ *
++ * This function parses the @str size specifier, which may be one of
++ * 'KiB', 'MiB', or 'GiB' into an integer multiplier. Returns positive
++ * size multiplier in case of success and %-1 in case of failure.
++ */
++static int get_multiplier(const char *str)
++{
++	if (!str)
++		return 1;
++
++	/* Remove spaces before the specifier */
++	while (*str == ' ' || *str == '\t')
++		str += 1;
++
++	if (!strcmp(str, "KiB"))
++		return 1024;
++	if (!strcmp(str, "MiB"))
++		return 1024 * 1024;
++	if (!strcmp(str, "GiB"))
++		return 1024 * 1024 * 1024;
++
++	return -1;
++}
++
++/**
++ * ubiutils_get_bytes - convert a string containing amount of bytes into an
++ * integer
++ * @str: string to convert
++ *
++ * This function parses @str which may have one of 'KiB', 'MiB', or 'GiB'
++ * size specifiers. Returns positive amount of bytes in case of success and %-1
++ * in case of failure.
++ */
++long long ubiutils_get_bytes(const char *str)
++{
++	char *endp;
++	long long bytes = strtoull(str, &endp, 0);
++
++	if (endp == str || bytes < 0) {
++		fprintf(stderr, "incorrect amount of bytes: \"%s\"\n", str);
++		return -1;
++	}
++
++	if (*endp != '\0') {
++		int mult = get_multiplier(endp);
++
++		if (mult == -1) {
++			fprintf(stderr, "bad size specifier: \"%s\" - "
++			        "should be 'KiB', 'MiB' or 'GiB'\n", endp);
++			return -1;
++		}
++		bytes *= mult;
++	}
++
++	return bytes;
++}
++
++/**
++ * ubiutils_print_bytes - print bytes.
++ * @bytes: variable to print
++ * @bracket: whether brackets have to be put or not
++ *
++ * This is a helper function which prints amount of bytes in a human-readable
++ * form, i.e., it prints the exact amount of bytes following by the approximate
++ * amount of Kilobytes, Megabytes, or Gigabytes, depending on how big @bytes
++ * is.
++ */
++void ubiutils_print_bytes(long long bytes, int bracket)
++{
++	const char *p;
++
++	if (bracket)
++		p = " (";
++	else
++		p = ", ";
++
++	printf("%lld bytes", bytes);
++
++	if (bytes > 1024 * 1024 * 1024)
++		printf("%s%.1f GiB", p, (double)bytes / (1024 * 1024 * 1024));
++	else if (bytes > 1024 * 1024)
++		printf("%s%.1f MiB", p, (double)bytes / (1024 * 1024));
++	else if (bytes > 1024 && bytes != 0)
++		printf("%s%.1f KiB", p, (double)bytes / 1024);
++	else
++		return;
++
++	if (bracket)
++		printf(")");
++}
++
++/**
++ * ubiutils_print_text - print text and fold it.
++ * @stream: file stream to print to
++ * @text: text to print
++ * @width: maximum allowed text width
++ *
++ * Print text and fold it so that each line would not have more then @width
++ * characters.
++ */
++void ubiutils_print_text(FILE *stream, const char *text, int width)
++{
++	int pos, bpos = 0;
++	const char *p;
++	char line[1024];
++
++	if (width > 1023) {
++		fprintf(stream, "%s\n", text);
++		return;
++	}
++	p = text;
++	pos = 0;
++	while (p[pos]) {
++		while (!isspace(p[pos])) {
++			line[pos] = p[pos];
++			if (!p[pos])
++				break;
++			++pos;
++			if (pos == width) {
++				line[pos] = '\0';
++				fprintf(stream, "%s\n", line);
++				p += pos;
++				pos = 0;
++			}
++		}
++		while (pos < width) {
++			line[pos] = p[pos];
++			if (!p[pos]) {
++				bpos = pos;
++				break;
++			}
++			if (isspace(p[pos]))
++				bpos = pos;
++			++pos;
++		}
++		line[bpos] = '\0';
++		fprintf(stream, "%s\n", line);
++		p += bpos;
++		pos = 0;
++		while (p[pos] && isspace(p[pos]))
++			++p;
++	}
++}
++
++/**
++ * ubiutils_srand - randomly seed the standard pseudo-random generator.
++ *
++ * This helper function seeds the standard libc pseudo-random generator with a
++ * more or less random value to make sure the 'rand()' call does not return the
++ * same sequence every time UBI utilities run. Returns zero in case of success
++ * and a %-1 in case of error.
++ */
++int ubiutils_srand(void)
++{
++	struct timeval tv;
++	struct timezone tz;
++	unsigned int seed;
++
++	/*
++	 * Just assume that a combination of the PID + current time is a
++	 * reasonably random number.
++	 */
++	if (gettimeofday(&tv, &tz))
++		return -1;
++
++	seed = (unsigned int)tv.tv_sec;
++	seed += (unsigned int)tv.tv_usec;
++	seed *= getpid();
++	seed %= RAND_MAX;
++	srand(seed);
++	return 0;
++}

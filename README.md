@@ -16,4 +16,4 @@ Display | TFT-TN, 2.8", 240 x 320 pixels, 143 ppi
 Rear Camera  | 0.3 MP
 Front Camera | 0.3 MP
 
-![Device Picture](https://ds-blobs-2.cdn.devapps.ru/19219154.png)
+![Device Picture](https://bq.ru/upload/resize_cache/iblock/ca0/500_2000_0/_01_Foto_600x600_2800.jpg)

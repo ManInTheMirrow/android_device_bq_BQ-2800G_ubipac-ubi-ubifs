@@ -17,3 +17,4 @@ Rear Camera  | 0.3 MP
 Front Camera | 0.3 MP
 
 ![Device Picture](https://bq.ru/upload/resize_cache/iblock/ca0/500_2000_0/_01_Foto_600x600_2800.jpg)
+![twrp](https://github.com/ManInTheMirrow/android_device_bq_BQ-2800G_ubipac-ubi-ubifs/assets/75084095/40ceff28-2864-4603-9794-36be31903190)

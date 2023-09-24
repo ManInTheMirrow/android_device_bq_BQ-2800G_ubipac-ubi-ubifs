@@ -1,2 +1,19 @@
-# android_device_bq_BQ-2800G_ubipac-ubi-ubifs
-Device Tree for compiling custom recoveries for BQ-2800G.
+# Device Tree For BQ 2800G Online
+
+## Device specification
+
+Basic   | Spec Sheet
+-------:|:------------------------
+CPU     | Single-core 1.0 GHz
+CHIPSET | Spreadtrum SC7715GA
+GPU     | Mali-400 MP1
+OS      | Mocor 5 (based on Android 4.4.2)
+RAM     | 256 MB
+Storage | 512 MB
+Battery | Li-Po 1000 mAh
+Dimensions | 132.2 x 56 x 13.9 mm
+Display | TFT-TN, 2.8", 240 x 320 pixels, 143 ppi
+Rear Camera  | 0.3 MP
+Front Camera | 0.3 MP
+
+![Device Picture](https://ds-blobs-2.cdn.devapps.ru/19219154.png)

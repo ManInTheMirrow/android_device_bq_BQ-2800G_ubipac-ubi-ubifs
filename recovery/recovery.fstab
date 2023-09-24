@@ -1,0 +1,7 @@
+#/boot			ubi         /dev/ubi0_boot
+#/recovery		ubi			/dev/ubi0_recovery
+/system			ubifs		/dev/ubi0_system
+/data			ubifs		ubipac
+/cache			ubifs		/dev/ubi0_cache
+/prodnv		    ubifs		/dev/ubi0_prodnv
+/sdcard			vfat	/dev/block/platform/sprd-sdhci.0/mmcblk0p1	/dev/block/platform/sprd-sdhci.0/mmcblk0

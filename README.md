@@ -1,5 +1,7 @@
 # Device Tree For BQ 2800G Online
 
+Sources of CTR 3.0: https://github.com/ManInTheMirrow/carliv_touch_recovery_ubipac-ubi-ubifs
+
 ## Device specification
 
 Basic   | Spec Sheet

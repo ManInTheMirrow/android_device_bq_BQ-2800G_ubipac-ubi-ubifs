@@ -15,4 +15,5 @@ Dimensions | 132.2 x 56 x 13.9 mm
 Display | TFT-TN, 2.8", 240 x 320 pixels, 143 ppi
 Rear Camera  | 0.3 MP
 Front Camera | 0.3 MP
+
 ![Device Picture](https://ds-blobs-2.cdn.devapps.ru/19219154.png)
